@@ -7,6 +7,10 @@ import {
   envoyerRappelsJMoinsUn,
   suspendreAbonnementsExpires,
   alerterExpirationImminente,
+  envoyerRapportJournalier,
+  detecterClientsAbusifs,
+  nettoyerTentativesAnciennes,
+  nettoyerRateLimits,
 } from './services/cronJobs.js';
 
 const app = express();
@@ -57,10 +61,50 @@ function demarrerCronJobs() {
     { timezone: 'Indian/Mauritius' }
   );
 
+  // Rapport journalier admin — chaque jour à 17h00
+  cron.schedule(
+    '0 17 * * *',
+    async () => {
+      await envoyerRapportJournalier();
+    },
+    { timezone: 'Indian/Mauritius' }
+  );
+
+  // Détection clients abusifs — 2 fois par jour (10h et 20h)
+  cron.schedule(
+    '0 10,20 * * *',
+    async () => {
+      await detecterClientsAbusifs();
+    },
+    { timezone: 'Indian/Mauritius' }
+  );
+
+  // Nettoyage tentatives anciennes — chaque dimanche à 3h00
+  cron.schedule(
+    '0 3 * * 0',
+    async () => {
+      await nettoyerTentativesAnciennes();
+    },
+    { timezone: 'Indian/Mauritius' }
+  );
+
+  // Nettoyage rate limits — toutes les heures
+  cron.schedule(
+    '0 * * * *',
+    async () => {
+      await nettoyerRateLimits();
+    },
+    { timezone: 'Indian/Mauritius' }
+  );
+
   console.log('Cron jobs démarrés :');
   console.log('  - Rappels J-1      : chaque jour à 20h00 (Maurice)');
   console.log('  - Suspension       : chaque jour à minuit (Maurice)');
   console.log('  - Alertes exp.     : chaque jour à 09h00 (Maurice)');
+  console.log('  - Rapport admin    : chaque jour à 17h00 (Maurice)');
+  console.log('  - Détection abus   : 2x/jour à 10h et 20h (Maurice)');
+  console.log('  - Nettoyage tokens : chaque dimanche à 3h00 (Maurice)');
+  console.log('  - Nettoyage limits : toutes les heures (Maurice)');
 }
 
 // ================================

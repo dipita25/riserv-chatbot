@@ -5,25 +5,27 @@
 1. [Vue d'ensemble](#vue-densemble)
 2. [Architecture générale](#architecture-générale)
 3. [Stack technique](#stack-technique)
-4. [Flux utilisateurs](#flux-utilisateurs)
+4. [Sécurité](#sécurité)
+5. [Flux utilisateurs](#flux-utilisateurs)
    - [Flux client](#flux-client)
    - [Flux prestataire](#flux-prestataire)
    - [Flux onboarding prestataire](#flux-onboarding-prestataire)
-5. [Fonctionnalités prestataire](#fonctionnalités-prestataire)
+6. [Fonctionnalités prestataire](#fonctionnalités-prestataire)
    - [Agenda](#agenda)
    - [Gestion des rendez-vous](#gestion-des-rendez-vous)
    - [Gestion des disponibilités](#gestion-des-disponibilités)
    - [Gestion des services](#gestion-des-services)
    - [Aide guidée et support](#aide-guidée-et-support)
-6. [Fonctionnalités client](#fonctionnalités-client)
+7. [Fonctionnalités client](#fonctionnalités-client)
    - [Notes vocales](#notes-vocales)
-7. [Support multilingue](#support-multilingue)
-8. [Plans et abonnements](#plans-et-abonnements)
-9. [Système de notifications et rappels](#système-de-notifications-et-rappels)
-10. [Identification des utilisateurs](#identification-des-utilisateurs)
-11. [Provider WhatsApp](#provider-whatsapp)
-12. [Variables d'environnement](#variables-denvironnement)
-13. [Roadmap](#roadmap)
+8. [Support multilingue](#support-multilingue)
+9. [Plans et abonnements](#plans-et-abonnements)
+10. [Système de notifications et rappels](#système-de-notifications-et-rappels)
+11. [Identification des utilisateurs](#identification-des-utilisateurs)
+12. [Provider WhatsApp](#provider-whatsapp)
+13. [Variables d'environnement](#variables-denvironnement)
+14. [Logging et Monitoring](#logging-et-monitoring)
+15. [Roadmap](#roadmap)
 
 ---
 
@@ -102,21 +104,28 @@ Chaque message entrant contient le numéro de téléphone de l'expéditeur (`fro
 |---|---|---|
 | Backend / API | Node.js + Express | Dev + Prod |
 | Base de données | Supabase (PostgreSQL) | Dev + Prod |
-| IA / NLP | Claude API (claude-sonnet) | Dev + Prod |
+| IA / NLP | Claude API ou OpenAI GPT-4 | Dev + Prod |
 | Transcription vocale | OpenAI Whisper API | Dev + Prod |
 | WhatsApp (dev) | Twilio WhatsApp Sandbox | Dev uniquement |
-| WhatsApp (prod) | Meta Cloud API | Prod uniquement |
+| WhatsApp (prod) | **Gupshup** (recommandé) ou Meta Cloud API | Prod uniquement |
 | Hébergement | Render.com | Dev + Prod |
 | Cron jobs | Render Cron Jobs | Dev + Prod |
+| Sécurité webhook | Token personnalisé + IP whitelist + Rate limiting | Prod |
 
 ### Abstraction du provider WhatsApp
 
-Le provider WhatsApp est **entièrement abstrait** dans `services/whatsappService.js`. Le switch Twilio → Meta se fait en changeant une seule variable d'environnement (`WHATSAPP_PROVIDER`) sans modifier le code applicatif.
+Le provider WhatsApp est **entièrement abstrait** dans `services/whatsappService.js`. Le switch entre providers se fait en changeant une seule variable d'environnement (`WHATSAPP_PROVIDER`) sans modifier le code applicatif.
 
 ```
-WHATSAPP_PROVIDER=twilio   ← développement
-WHATSAPP_PROVIDER=meta     ← production
+WHATSAPP_PROVIDER=twilio    ← développement
+WHATSAPP_PROVIDER=gupshup   ← production (recommandé)
+WHATSAPP_PROVIDER=meta      ← production (alternative)
 ```
+
+**Providers supportés** :
+- **Twilio** : Sandbox pour développement rapide
+- **Gupshup** : Solution production recommandée (fiable, bien documentée)
+- **Meta Cloud API** : Alternative production (plus complexe)
 
 ---
 
@@ -797,7 +806,15 @@ await envoyerTemplate(to, 'rappel_rdv', { prenom: 'Sarah', heure: '14h00' })
 # ================================
 # PROVIDER WHATSAPP
 # ================================
-WHATSAPP_PROVIDER=twilio        # 'twilio' (dev) ou 'meta' (prod)
+WHATSAPP_PROVIDER=gupshup        # 'twilio' (dev), 'gupshup' (prod), ou 'meta' (prod alt)
+
+# ================================
+# GUPSHUP (production recommandé)
+# ================================
+GUPSHUP_APP_ID=xxxxxxxxxx
+GUPSHUP_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GUPSHUP_WEBHOOK_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # Token sécurisé (32+ chars)
+GUPSHUP_ALLOWED_IPS=1.2.3.4,5.6.7.8                      # IPs Gupshup (optionnel)
 
 # ================================
 # TWILIO (développement)
@@ -807,11 +824,12 @@ TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 TWILIO_NUMBER=+14155238886      # Numéro sandbox WhatsApp Twilio
 
 # ================================
-# META CLOUD API (production)
+# META CLOUD API (production alternative)
 # ================================
 META_PHONE_ID=xxxxxxxxxxxxxxxxx
 META_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 META_VERIFY_TOKEN=xxxxxxxx      # Token de vérification webhook
+META_APP_SECRET=xxxxxxxx        # Pour vérification signature
 
 # ================================
 # SUPABASE
@@ -821,9 +839,11 @@ SUPABASE_ANON_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxx
 SUPABASE_SERVICE_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # ================================
-# CLAUDE API
+# IA
 # ================================
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxx
+AI_PROVIDER=openai              # 'openai' ou 'claude'
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxx  # Si AI_PROVIDER=claude
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxx        # Si AI_PROVIDER=openai
 
 # ================================
 # OPENAI WHISPER (notes vocales)
@@ -835,7 +855,67 @@ OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxx
 # ================================
 PORT=3000
 NODE_ENV=development            # 'development' ou 'production'
+
+# ================================
+# SUPPORT
+# ================================
+SUPPORT_EMAIL=support@riserv.mu
+ADMIN_PHONE=+23052123456        # Numéro admin avec accès total
 ```
+
+**Voir aussi** :
+- Configuration Gupshup détaillée : `docs/CONFIGURATION_GUPSHUP.md`
+- Sécurité webhook : `docs/SECURITE_WEBHOOK.md`
+
+---
+
+## Logging et Monitoring
+
+### Système de Logs
+
+Riserv intègre un système de logging complet avec identifiants uniques pour tracer chaque requête de bout en bout :
+
+**Tags principaux** :
+- `[WEBHOOK {id}]` - Réception et validation des messages
+- `[ROUTER {id}]` - Distribution et routage
+- `[CLIENT {id}]` - Traitement réservations clients
+- `[PRESTATAIRE {id}]` - Gestion d'activité prestataires
+- `[IA {id}]` - Appels Intelligence Artificielle
+- `[SEND {id}]` - Envoi messages WhatsApp
+- `[ACCES]` - Contrôle d'accès et permissions
+- `[SÉCURITÉ]` - Tentatives suspectes
+
+**Exemple de trace complète** :
+
+```
+[WEBHOOK a1b2c3] ========== NOUVELLE REQUÊTE ==========
+[WEBHOOK a1b2c3] IP: 203.192.X.X
+[WEBHOOK a1b2c3] Format détecté: Gupshup
+[WEBHOOK a1b2c3] ✅ Vérification sécurité passée
+[ROUTER d4e5f6] ✅ Identifié: PRESTATAIRE (Salon Beauté)
+[PRESTATAIRE g7h8i9] Message: "agenda aujourd'hui"
+[IA j0k1l2] Appel openai { tokensTotal: 1570 }
+[PRESTATAIRE g7h8i9] → Agenda jour: 4 RDV trouvés
+[SEND m3n4o5] ✅ Message envoyé avec succès
+```
+
+### Commandes de Surveillance
+
+```bash
+# Logs temps réel
+tail -f logs/app.log
+
+# Uniquement les erreurs
+tail -f logs/app.log | grep "❌"
+
+# Tentatives suspectes
+tail -f logs/app.log | grep "SÉCURITÉ"
+
+# Tokens consommés (analyse coûts)
+grep "Tokens consommés" logs/app.log | grep -oP '\d+' | awk '{sum+=$1} END {print sum}'
+```
+
+**Documentation complète** : `docs/LOGS.md`
 
 ---
 
@@ -843,13 +923,17 @@ NODE_ENV=development            # 'development' ou 'production'
 
 ### MVP (v1.0)
 
-- [x] Architecture WhatsApp (Twilio dev / Meta prod)
+- [x] Architecture WhatsApp (Twilio dev / Gupshup prod / Meta prod alt)
+- [x] Sécurité webhook multicouche (token, IP whitelist, rate limiting)
+- [x] Système de logging complet avec IDs uniques
 - [x] Identification automatique client / prestataire
 - [x] Onboarding prestataire automatique
 - [x] Support multilingue (FR / EN / Créole)
 - [x] Aide guidée et clarification automatique
 - [x] Plans et abonnements (Starter / Pro / Business)
 - [x] Contrôle d'accès par fonctionnalité
+- [x] Système d'upgrade interactif
+- [x] Restriction horaire Starter (18h00)
 - [ ] Schéma Supabase complet
 - [ ] Flow réservation client complet
 - [ ] Agenda prestataire (jour / semaine)

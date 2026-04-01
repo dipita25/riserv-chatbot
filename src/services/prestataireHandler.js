@@ -1,3 +1,8 @@
+import crypto from 'crypto';
+import {
+  notifierAnnulation,
+  notifierDeplacement,
+} from './notificationService.js';
 import {
   getReservationsJour,
   getReservationsSemaine,
@@ -16,6 +21,9 @@ import {
 import { envoyerMessage } from './whatsappService.js';
 import { envoyerMessageClaude } from './claudeService.js';
 import { formaterDate, getJourSemaine } from '../utils/dateUtils.js';
+import { verifierAcces } from '../middlewares/verifierAcces.js';
+import { trackConsommationToken, getMessageQuotaRestant, SEUIL_ALERTE } from './rateLimitService.js';
+import { estimerTokens } from '../utils/tokenEstimator.js';
 
 // ================================
 // SYSTEM PROMPT PRESTATAIRE
@@ -63,34 +71,106 @@ Types d'actions disponibles :
 // ================================
 // POINT D'ENTRÉE PRINCIPAL
 // ================================
-export async function handlePrestataire(from, body, numMedia, prestataire) {
-  // Aide guidée — détecter si le prestataire est perdu
-  const motsClesAide = ['aide', 'help', 'comment', 'ki manyer', 'how', '?'];
-  const demandeAide = motsClesAide.some(mot =>
-    body.toLowerCase().includes(mot)
-  );
+export async function handlePrestataire(from, body, numMedia, prestataire, rateLimit) {
+  const handlerId = crypto.randomBytes(4).toString('hex');
+  
+  console.log(`\n[PRESTATAIRE ${handlerId}] ========== DÉBUT TRAITEMENT ==========`);
+  console.log(`[PRESTATAIRE ${handlerId}] Prestataire: ${prestataire.nom} (${prestataire.plan})`);
+  console.log(`[PRESTATAIRE ${handlerId}] Message: "${body.substring(0, 100)}${body.length > 100 ? '...' : ''}"`);
+  console.log(`[PRESTATAIRE ${handlerId}] Médias: ${numMedia}`);
+  console.log(`[PRESTATAIRE ${handlerId}] Rate limit restant: ${rateLimit?.restant || 'N/A'}`);
 
-  if (demandeAide && body.length < 30) {
-    await afficherMenuAide(from, prestataire);
-    return;
-  }
+  try {
+    // Bypass pour l'admin — accès total sans restriction
+    const adminPhone = process.env.ADMIN_PHONE;
+    const estAdmin = adminPhone && from === adminPhone;
 
-  // Envoyer à Claude pour interpréter la commande
-  const reponse = await envoyerMessageClaude(
-    from,
-    'prestataire',
-    prestataire.id,
-    getSystemPromptPrestataire(prestataire),
-    `Date et heure actuelles : ${new Date().toLocaleString('fr-FR', { timeZone: 'Indian/Mauritius' })}
+    // Vérifier que l'abonnement est actif (sauf pour l'admin)
+    if (!estAdmin) {
+      console.log(`[PRESTATAIRE ${handlerId}] Vérification accès...`);
+      const acces = await verifierAcces(prestataire, 'agenda');
+
+      if (!acces.autorise) {
+        console.log(`[PRESTATAIRE ${handlerId}] ⛔ Accès refusé: ${acces.raison}`);
+        await envoyerMessage(from, acces.message);
+        return;
+      }
+      console.log(`[PRESTATAIRE ${handlerId}] ✅ Accès autorisé`);
+    } else {
+      console.log(`[PRESTATAIRE ${handlerId}] Admin détecté - Bypass complet`);
+    }
+
+    // Aide guidée — détecter si le prestataire est perdu
+    const motsClesAide = ['aide', 'help', 'comment', 'ki manyer', 'how', '?'];
+    const demandeAide = motsClesAide.some(mot =>
+      body.toLowerCase().includes(mot)
+    );
+
+    if (demandeAide && body.length < 30) {
+      console.log(`[PRESTATAIRE ${handlerId}] → Demande d'aide détectée`);
+      await afficherMenuAide(from, prestataire);
+      return;
+    }
+
+    const systemPrompt = getSystemPromptPrestataire(prestataire);
+    const userPrompt = `Date et heure actuelles : ${new Date().toLocaleString('fr-FR', { timeZone: 'Indian/Mauritius' })}
     
-    Message du prestataire : "${body}"`
-  );
+    Message du prestataire : "${body}"`;
 
-  // Extraire et exécuter les actions détectées
-  const reponseFinale = await executerActions(from, reponse, prestataire);
+    console.log(`[PRESTATAIRE ${handlerId}] → Appel IA pour interpréter commande...`);
+    // Envoyer à Claude pour interpréter la commande
+    const reponse = await envoyerMessageClaude(
+      from,
+      'prestataire',
+      prestataire.id,
+      systemPrompt,
+      userPrompt
+    );
 
-  // Envoyer la réponse finale au prestataire
-  await envoyerMessage(from, reponseFinale);
+    // Tracker la consommation
+    const tokensEstimes = estimerTokens(systemPrompt + userPrompt + reponse);
+    console.log(`[PRESTATAIRE ${handlerId}] Tokens consommés (estimés): ${tokensEstimes}`);
+    
+    await trackConsommationToken(
+      from,
+      'prestataire',
+      'gestion_generale',
+      tokensEstimes,
+      prestataire.id
+    );
+
+    console.log(`[PRESTATAIRE ${handlerId}] → Exécution actions détectées...`);
+    // Extraire et exécuter les actions détectées
+    const reponseFinale = await executerActions(from, reponse, prestataire, handlerId);
+
+    console.log(`[PRESTATAIRE ${handlerId}] → Envoi réponse finale...`);
+    // Envoyer la réponse finale au prestataire
+    await envoyerMessage(from, reponseFinale);
+
+    // Alerte quota restant si nécessaire
+    if (rateLimit && rateLimit.restant <= SEUIL_ALERTE) {
+      console.log(`[PRESTATAIRE ${handlerId}] ⚠️ Seuil d'alerte atteint: ${rateLimit.restant} messages restants`);
+      const alerteMsg = getMessageQuotaRestant(
+        rateLimit.restant,
+        rateLimit.renouvellement,
+        prestataire.langue || 'fr',
+        'prestataire',
+        prestataire.plan
+      );
+      await envoyerMessage(from, alerteMsg);
+    }
+
+    console.log(`[PRESTATAIRE ${handlerId}] ✅ Traitement terminé avec succès`);
+  } catch (err) {
+    console.error(`[PRESTATAIRE ${handlerId}] ❌ ERREUR CRITIQUE:`, {
+      error: err.message,
+      stack: err.stack,
+      prestataire: prestataire.nom,
+    });
+    throw err;
+  } finally {
+    console.log(`[PRESTATAIRE ${handlerId}] ========== FIN TRAITEMENT ==========\n`);
+  }
 }
 
 // ================================
@@ -122,7 +202,7 @@ async function afficherMenuAide(from, prestataire) {
 // ================================
 // EXÉCUTER LES ACTIONS
 // ================================
-async function executerActions(from, reponse, prestataire) {
+async function executerActions(from, reponse, prestataire, handlerId) {
   // Extraire toutes les actions de la réponse
   const regexAction = /\[ACTION:([^\]]+)\]/g;
   const actions = [];
@@ -131,6 +211,10 @@ async function executerActions(from, reponse, prestataire) {
   while ((match = regexAction.exec(reponse)) !== null) {
     actions.push(match[1]);
   }
+
+  console.log(`[PRESTATAIRE ${handlerId}] ${actions.length} action(s) détectée(s)`, {
+    actions: actions.map(a => a.split(':')[0]),
+  });
 
   // Supprimer les balises d'action du message final
   let reponseNette = reponse.replace(/\[ACTION:[^\]]+\]/g, '').trim();
@@ -141,10 +225,15 @@ async function executerActions(from, reponse, prestataire) {
     const type = parties[0];
 
     try {
+      console.log(`[PRESTATAIRE ${handlerId}] Exécution action: ${type}`, {
+        parametres: parties.slice(1),
+      });
+
       switch (type) {
         case 'AGENDA_JOUR': {
           const date = parties[1];
           const rdvs = await getReservationsJour(prestataire.id, date);
+          console.log(`[PRESTATAIRE ${handlerId}] → Agenda jour: ${rdvs.length} RDV trouvés`);
           const texteAgenda = formaterAgendaJour(rdvs, date);
           reponseNette = texteAgenda;
           break;
@@ -158,6 +247,7 @@ async function executerActions(from, reponse, prestataire) {
             dateDebut,
             dateFin
           );
+          console.log(`[PRESTATAIRE ${handlerId}] → Agenda semaine: ${rdvs.length} RDV trouvés`);
           const texteAgenda = formaterAgendaSemaine(rdvs, dateDebut, dateFin);
           reponseNette = texteAgenda;
           break;
@@ -165,25 +255,24 @@ async function executerActions(from, reponse, prestataire) {
 
         case 'ANNULER_RDV': {
           const reservationId = parties[1];
+          console.log(`[PRESTATAIRE ${handlerId}] → Annulation RDV: ${reservationId}`);
           const rdv = await annulerReservation(reservationId, 'prestataire');
-          // Notifier le client
-          await envoyerMessage(
-            rdv.clients.telephone,
-            `Votre rendez-vous du ${formaterDate(rdv.date)} à ${rdv.heure} ` +
-              `chez ${rdv.prestataires.nom} a été annulé.\n` +
-              `Contactez-nous pour reprogrammer.`
-          );
+          await notifierAnnulation(rdv, 'prestataire');
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ RDV annulé et client notifié`);
           break;
         }
 
         case 'CONFIRMER_RDV': {
           const reservationId = parties[1];
+          console.log(`[PRESTATAIRE ${handlerId}] → Confirmation RDV: ${reservationId}`);
           const rdv = await confirmerReservation(reservationId);
+          // Notification de confirmation au client
           await envoyerMessage(
             rdv.clients.telephone,
-            `✅ Votre rendez-vous du ${formaterDate(rdv.date)} à ${rdv.heure} ` +
-              `chez ${rdv.prestataires.nom} est confirmé.`
+            `✅ Votre rendez-vous du ${formaterDate(rdv.date)} à ` +
+              `${rdv.heure.substring(0, 5)} chez ${rdv.prestataires.nom} est confirmé.`
           );
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ RDV confirmé et client notifié`);
           break;
         }
 
@@ -192,7 +281,13 @@ async function executerActions(from, reponse, prestataire) {
           const fin = parties[2];
           const typeBlocage = parties[3] || 'indisponibilite';
           const motif = parties[4] || '';
+          console.log(`[PRESTATAIRE ${handlerId}] → Blocage créneau`, {
+            debut,
+            fin,
+            type: typeBlocage,
+          });
           await bloquerCreneau(prestataire.id, debut, fin, typeBlocage, motif);
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ Créneau bloqué`);
           break;
         }
 
@@ -200,11 +295,13 @@ async function executerActions(from, reponse, prestataire) {
           const nom = parties[1];
           const duree = parseInt(parties[2]);
           const prix = parseInt(parties[3]);
+          console.log(`[PRESTATAIRE ${handlerId}] → Ajout service: ${nom} (${duree}min, Rs${prix})`);
           await ajouterService(prestataire.id, {
             nom,
             duree_minutes: duree,
             prix,
           });
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ Service ajouté`);
           break;
         }
 
@@ -215,35 +312,50 @@ async function executerActions(from, reponse, prestataire) {
             champ === 'duree_minutes' || champ === 'prix'
               ? parseInt(parties[3])
               : parties[3];
+          console.log(`[PRESTATAIRE ${handlerId}] → Modification service ${serviceId}: ${champ} = ${valeur}`);
           await modifierService(serviceId, { [champ]: valeur });
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ Service modifié`);
           break;
         }
 
         case 'SUPPRIMER_SERVICE': {
           const serviceId = parties[1];
+          console.log(`[PRESTATAIRE ${handlerId}] → Suppression service: ${serviceId}`);
           // Vérifier s'il y a des RDV futurs
           const rdvsFuturs = await getReservationsFuturesService(serviceId);
           if (rdvsFuturs.length > 0) {
+            console.warn(`[PRESTATAIRE ${handlerId}] ⚠️ ${rdvsFuturs.length} RDV futur(s) liés à ce service`);
             reponseNette +=
               `\n\n⚠️ Attention : ${rdvsFuturs.length} RDV futur(s) ` +
               `sont liés à ce service. Ils ne seront pas annulés automatiquement.`;
           }
           await supprimerService(serviceId);
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ Service supprimé`);
           break;
         }
 
         case 'MODIFIER_HORAIRES': {
           const horaires = JSON.parse(parties.slice(1).join(':'));
+          console.log(`[PRESTATAIRE ${handlerId}] → Modification horaires`, horaires);
           await mettreAJourPrestataire(prestataire.id, { horaires });
+          console.log(`[PRESTATAIRE ${handlerId}] ✅ Horaires modifiés`);
           break;
         }
+
+        default:
+          console.warn(`[PRESTATAIRE ${handlerId}] ⚠️ Action inconnue: ${type}`);
       }
     } catch (err) {
-      console.error(`Erreur action ${type} :`, err.message);
+      console.error(`[PRESTATAIRE ${handlerId}] ❌ Erreur action ${type}:`, {
+        error: err.message,
+        parametres: parties.slice(1),
+        stack: err.stack,
+      });
       reponseNette += `\n\n❌ Erreur lors de l'exécution de l'action ${type}.`;
     }
   }
 
+  console.log(`[PRESTATAIRE ${handlerId}] Actions exécutées, réponse finale prête`);
   return reponseNette;
 }
 

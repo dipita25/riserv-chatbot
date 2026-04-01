@@ -7,62 +7,53 @@ import {
 } from './supabaseService.js';
 import { envoyerMessage } from './whatsappService.js';
 import { envoyerMessageClaude } from './claudeService.js';
+import { trackConsommationToken, getMessageQuotaRestant, SEUIL_ALERTE } from './rateLimitService.js';
+import { estimerTokens } from '../utils/tokenEstimator.js';
 
 // ================================
 // SYSTEM PROMPT ONBOARDING
 // ================================
-const SYSTEM_PROMPT_ONBOARDING = `Tu es l'assistant d'onboarding de Riserv, une plateforme de réservation WhatsApp pour les professionnels à Maurice.
+const SYSTEM_PROMPT_ONBOARDING = `Tu es un(e) agent(e) du service client de Riserv, une plateforme de réservation WhatsApp pour les professionnels à Maurice.
 
-Ton rôle est de guider un nouveau prestataire pour configurer son établissement étape par étape.
+Ton rôle est de guider un nouveau prestataire pour configurer son établissement de façon naturelle et chaleureuse, comme le ferait un vrai conseiller humain.
 
 RÈGLES IMPORTANTES :
 - Réponds toujours dans la langue du prestataire (français, anglais ou créole mauricien)
-- Sois chaleureux, encourageant et concis
+- Sois chaleureux, humain et naturel — jamais robotique
 - Ne pose qu'une seule question à la fois
-- Confirme toujours ce que tu as compris avant de passer à l'étape suivante
-- Si une réponse est incomplète ou ambiguë, redemande poliment
+- Confirme ce que tu as compris avant de passer à l'étape suivante
+- Ne mentionne jamais des mots clés à taper — déduis toi-même l'intention du prestataire
+- Si une réponse est ambiguë, demande confirmation naturellement
+- Ne mentionne jamais que tu es une IA
 
 ÉTAPES À SUIVRE :
 1. Demander le nom de l'établissement
-2. Demander les services proposés (nom, durée, prix) — un par un ou en liste
-3. Demander les jours et horaires d'ouverture
-
-FORMAT POUR EXTRAIRE LES SERVICES :
-Quand le prestataire donne ses services, extrais chaque service sous la forme :
-- Nom du service
-- Durée en minutes
-- Prix en roupies mauriciennes
-
-FORMAT POUR LES HORAIRES :
-Extrais les horaires sous la forme :
-{ "lun": {"debut": "09:00", "fin": "18:00", "ouvert": true}, ... }
-Pour les jours fermés : {"debut": null, "fin": null, "ouvert": false}`;
+2. Collecter les services (nom, durée, prix) — laisser le prestataire en donner autant qu'il veut
+3. Demander les jours et horaires d'ouverture`;
 
 // ================================
 // POINT D'ENTRÉE PRINCIPAL
 // ================================
-export async function handleOnboarding(from, body, sessionExistante) {
-  // Pas de session existante → c'est le tout premier message
+export async function handleOnboarding(from, body, sessionExistante, rateLimit) {
   if (!sessionExistante) {
     await demarrerOnboarding(from);
     return;
   }
 
-  // Session existante → continuer selon l'étape courante
   switch (sessionExistante.etape_courante) {
     case 'etape_1_nom':
-      await traiterEtape1(from, body, sessionExistante);
+      await traiterEtape1(from, body, sessionExistante, rateLimit);
       break;
     case 'etape_2_services':
-      await traiterEtape2(from, body, sessionExistante);
+      await traiterEtape2(from, body, sessionExistante, rateLimit);
       break;
     case 'etape_3_horaires':
-      await traiterEtape3(from, body, sessionExistante);
+      await traiterEtape3(from, body, sessionExistante, rateLimit);
       break;
     default:
       await envoyerMessage(
         from,
-        `Une erreur s'est produite. Tapez "RISERV PRO" pour recommencer.`
+        `Une erreur s'est produite. Écrivez-moi à nouveau pour recommencer.`
       );
   }
 }
@@ -71,55 +62,66 @@ export async function handleOnboarding(from, body, sessionExistante) {
 // DÉMARRAGE DE L'ONBOARDING
 // ================================
 async function demarrerOnboarding(from) {
-  // Créer la session en Supabase
   await creerOnboardingSession(from);
 
-  // Message de bienvenue
   await envoyerMessage(
     from,
     `Bienvenue sur Riserv ! 🎉\n\n` +
-      `Je vais vous aider à configurer votre établissement en 3 étapes rapides.\n\n` +
-      `Étape 1/3 — Quel est le nom de votre établissement ?`
+      `Je vais vous aider à configurer votre établissement en quelques minutes.\n\n` +
+      `Pour commencer — quel est le nom de votre établissement ?`
   );
 }
 
 // ================================
 // ÉTAPE 1 — NOM DE L'ÉTABLISSEMENT
 // ================================
-async function traiterEtape1(from, body, session) {
-  // Utiliser Claude pour valider et extraire le nom
+async function traiterEtape1(from, body, session, rateLimit) {
+  const systemPrompt = SYSTEM_PROMPT_ONBOARDING;
+  const userPrompt = `Le prestataire répond à "Quel est le nom de votre établissement ?" avec : "${body}"
+
+    Réponds EXACTEMENT sous ce format JSON et rien d'autre :
+    {"valide": true, "nom": "le nom extrait", "message": "message de confirmation chaleureux + demande naturelle des services avec un exemple"}
+
+    Si ce n'est pas un nom valide :
+    {"valide": false, "message": "message pour redemander naturellement"}`;
+
   const reponse = await envoyerMessageClaude(
     from,
     'onboarding',
     null,
-    SYSTEM_PROMPT_ONBOARDING,
-    `Le prestataire répond à "Quel est le nom de votre établissement ?" avec : "${body}"
-    
-    Si c'est un nom valide, réponds EXACTEMENT sous ce format JSON et rien d'autre :
-    {"valide": true, "nom": "le nom extrait", "message": "message de confirmation chaleureux + annonce étape 2 en demandant les services"}
-    
-    Si ce n'est pas un nom valide ou si c'est incompréhensible, réponds :
-    {"valide": false, "message": "message pour redemander le nom"}`
+    systemPrompt,
+    userPrompt
+  );
+
+  // Tracker la consommation
+  await trackConsommationToken(
+    from,
+    'onboarding',
+    'etape_1_nom',
+    estimerTokens(systemPrompt + userPrompt + reponse),
+    null
   );
 
   let parsed;
   try {
-    parsed = JSON.parse(reponse);
+    const nettoye = reponse.replace(/```json|```/g, '').trim();
+    parsed = JSON.parse(nettoye);
   } catch {
-    // Si Claude ne renvoie pas du JSON propre, on réessaie
-    await envoyerMessage(
-      from,
-      `Pouvez-vous me donner le nom de votre établissement ?`
-    );
+    await envoyerMessage(from, `Quel est le nom de votre établissement ?`);
     return;
   }
 
   if (!parsed.valide) {
     await envoyerMessage(from, parsed.message);
+    
+    // Alerte quota pour onboarding
+    if (rateLimit && rateLimit.restant <= SEUIL_ALERTE) {
+      const alerteMsg = `⚠️ Il vous reste ${rateLimit.restant} message${rateLimit.restant > 1 ? 's' : ''} pour finaliser votre inscription`;
+      await envoyerMessage(from, alerteMsg);
+    }
     return;
   }
 
-  // Sauvegarder le nom et passer à l'étape 2
   await mettreAJourOnboardingSession(from, {
     etape_courante: 'etape_2_services',
     donnees_collectees: {
@@ -129,118 +131,112 @@ async function traiterEtape1(from, body, session) {
   });
 
   await envoyerMessage(from, parsed.message);
+  
+  // Alerte quota
+  if (rateLimit && rateLimit.restant <= SEUIL_ALERTE) {
+    const alerteMsg = `⚠️ Il vous reste ${rateLimit.restant} message${rateLimit.restant > 1 ? 's' : ''} pour finaliser votre inscription`;
+    await envoyerMessage(from, alerteMsg);
+  }
 }
 
 // ================================
 // ÉTAPE 2 — SERVICES
+// Claude décide lui-même si le prestataire a terminé
 // ================================
-async function traiterEtape2(from, body, session) {
-  // Mots clés pour passer à l'étape suivante
-  const motsClesTermine = [
-    'c est tout',
-    "c'est tout",
-    "c'est tout",
-    'terminé',
-    'termine',
-    'fini',
-    'done',
-    'fin',
-    'next',
-    'suivant',
-  ];
-  const messageNormalise = body.toLowerCase().trim();
-  const veutPasser = motsClesTermine.some(mot =>
-    messageNormalise.includes(mot)
-  );
-
-  // Vérifier s'il a déjà des services et veut passer
+async function traiterEtape2(from, body, session, rateLimit) {
   const servicesExistants = session.donnees_collectees.services || [];
 
-  if (veutPasser && servicesExistants.length > 0) {
-    // Passer à l'étape 3
-    await mettreAJourOnboardingSession(from, {
-      etape_courante: 'etape_3_horaires',
-    });
+  const systemPrompt = SYSTEM_PROMPT_ONBOARDING;
+  const userPrompt = `Le prestataire "${session.donnees_collectees.nom}" configure ses services.
+    Services déjà enregistrés : ${JSON.stringify(servicesExistants)}
+    Nouveau message du prestataire : "${body}"
 
-    const listeServices = servicesExistants
-      .map(s => `• ${s.nom} — ${s.duree_minutes} min — Rs ${s.prix}`)
-      .join('\n');
+    Analyse ce message et réponds EXACTEMENT sous ce format JSON :
+    {
+      "services_extraits": [{"nom": "...", "duree_minutes": 45, "prix": 350}],
+      "a_termine": false,
+      "message": "..."
+    }
 
-    await envoyerMessage(
-      from,
-      `Parfait ! Voici vos services enregistrés :\n\n${listeServices}\n\n` +
-        `Étape 3/3 — Quels sont vos jours et horaires d'ouverture ?\n\n` +
-        `Exemple : "Lundi au samedi de 9h à 18h, fermé le dimanche"`
-    );
-    return;
-  }
+    Règles pour "a_termine" :
+    - true si le prestataire indique clairement qu'il n'a plus de services à ajouter (peu importe comment il le dit)
+    - true si le prestataire pose une question sur autre chose ou change de sujet
+    - false si le prestataire donne encore des services ou si ce n'est pas clair
 
-  // Utiliser Claude pour extraire le service
+    Règles pour "message" :
+    - Si a_termine false et services extraits : confirme les services ajoutés et demande naturellement s'il en a d'autres
+    - Si a_termine false et aucun service : redemande naturellement avec un exemple
+    - Si a_termine true : enchaîne directement sur les horaires de façon naturelle
+
+    NE JAMAIS demander au prestataire de taper un mot clé précis.`;
+
   const reponse = await envoyerMessageClaude(
     from,
     'onboarding',
     null,
-    SYSTEM_PROMPT_ONBOARDING,
-    `Le prestataire "${session.donnees_collectees.nom}" donne ses services.
-    Services déjà enregistrés : ${JSON.stringify(servicesExistants)}
-    Nouveau message : "${body}"
-    
-    Extrais le ou les nouveaux services mentionnés et réponds EXACTEMENT sous ce format JSON :
-    {
-      "services_extraits": [
-        {"nom": "Coupe femme", "duree_minutes": 45, "prix": 350}
-      ],
-      "message": "confirmation des services extraits + demander s il y en a d autres ou s il peut taper 'c est tout' pour continuer"
-    }
-    
-    Si aucun service n'est compréhensible :
-    {"services_extraits": [], "message": "message pour redemander en donnant un exemple"}`
+    systemPrompt,
+    userPrompt
+  );
+
+  // Tracker la consommation
+  await trackConsommationToken(
+    from,
+    'onboarding',
+    'etape_2_services',
+    estimerTokens(systemPrompt + userPrompt + reponse),
+    null
   );
 
   let parsed;
   try {
-    parsed = JSON.parse(reponse);
+    const nettoye = reponse.replace(/```json|```/g, '').trim();
+    parsed = JSON.parse(nettoye);
   } catch {
     await envoyerMessage(
       from,
-      `Donnez-moi vos services un par un.\n` +
-        `Exemple : "Coupe femme 45 minutes Rs 350"`
+      `Quels services proposez-vous ? Donnez-moi le nom, la durée et le prix.\nExemple : Coupe femme, 45 minutes, Rs 350`
     );
     return;
   }
 
-  if (parsed.services_extraits.length === 0) {
-    await envoyerMessage(from, parsed.message);
-    return;
+  const tousLesServices = [
+    ...servicesExistants,
+    ...(parsed.services_extraits || []),
+  ];
+
+  if (tousLesServices.length > 0) {
+    await mettreAJourOnboardingSession(from, {
+      donnees_collectees: {
+        ...session.donnees_collectees,
+        services: tousLesServices,
+      },
+    });
   }
 
-  // Ajouter les nouveaux services à la liste existante
-  const tousLesServices = [...servicesExistants, ...parsed.services_extraits];
-
-  await mettreAJourOnboardingSession(from, {
-    donnees_collectees: {
-      ...session.donnees_collectees,
-      services: tousLesServices,
-    },
-  });
+  if (parsed.a_termine && tousLesServices.length > 0) {
+    await mettreAJourOnboardingSession(from, {
+      etape_courante: 'etape_3_horaires',
+    });
+  }
 
   await envoyerMessage(from, parsed.message);
+  
+  // Alerte quota
+  if (rateLimit && rateLimit.restant <= SEUIL_ALERTE) {
+    const alerteMsg = `⚠️ Il vous reste ${rateLimit.restant} message${rateLimit.restant > 1 ? 's' : ''} pour finaliser votre inscription`;
+    await envoyerMessage(from, alerteMsg);
+  }
 }
 
 // ================================
 // ÉTAPE 3 — HORAIRES
 // ================================
-async function traiterEtape3(from, body, session) {
-  // Utiliser Claude pour extraire les horaires
-  const reponse = await envoyerMessageClaude(
-    from,
-    'onboarding',
-    null,
-    SYSTEM_PROMPT_ONBOARDING,
-    `Le prestataire "${session.donnees_collectees.nom}" donne ses horaires.
+async function traiterEtape3(from, body, session, rateLimit) {
+  const systemPrompt = SYSTEM_PROMPT_ONBOARDING;
+  const userPrompt = `Le prestataire "${session.donnees_collectees.nom}" donne ses horaires.
     Message : "${body}"
-    
-    Extrais les horaires et réponds EXACTEMENT sous ce format JSON :
+
+    Réponds EXACTEMENT sous ce format JSON :
     {
       "valide": true,
       "horaires": {
@@ -252,31 +248,52 @@ async function traiterEtape3(from, body, session) {
         "sam": {"debut": "09:00", "fin": "13:00", "ouvert": true},
         "dim": {"debut": null, "fin": null, "ouvert": false}
       },
-      "message": "récapitulatif des horaires en langage naturel"
+      "message": "récapitulatif naturel des horaires"
     }
-    
+
     Si les horaires sont incompréhensibles :
-    {"valide": false, "message": "message pour redemander avec un exemple"}`
+    {"valide": false, "message": "message pour redemander naturellement avec un exemple"}`;
+
+  const reponse = await envoyerMessageClaude(
+    from,
+    'onboarding',
+    null,
+    systemPrompt,
+    userPrompt
+  );
+
+  // Tracker la consommation
+  await trackConsommationToken(
+    from,
+    'onboarding',
+    'etape_3_horaires',
+    estimerTokens(systemPrompt + userPrompt + reponse),
+    null
   );
 
   let parsed;
   try {
-    parsed = JSON.parse(reponse);
+    const nettoye = reponse.replace(/```json|```/g, '').trim();
+    parsed = JSON.parse(nettoye);
   } catch {
     await envoyerMessage(
       from,
-      `Pouvez-vous préciser vos horaires ?\n` +
-        `Exemple : "Lundi au samedi de 9h à 18h, fermé le dimanche"`
+      `Pouvez-vous me préciser vos horaires ?\nExemple : du lundi au samedi de 9h à 18h, fermé le dimanche`
     );
     return;
   }
 
   if (!parsed.valide) {
     await envoyerMessage(from, parsed.message);
+    
+    // Alerte quota
+    if (rateLimit && rateLimit.restant <= SEUIL_ALERTE) {
+      const alerteMsg = `⚠️ Il vous reste ${rateLimit.restant} message${rateLimit.restant > 1 ? 's' : ''} pour finaliser votre inscription`;
+      await envoyerMessage(from, alerteMsg);
+    }
     return;
   }
 
-  // Tout est collecté → créer le prestataire
   await finaliserOnboarding(from, session, parsed.horaires, parsed.message);
 }
 
@@ -286,32 +303,29 @@ async function traiterEtape3(from, body, session) {
 async function finaliserOnboarding(from, session, horaires, messageHoraires) {
   const donnees = session.donnees_collectees;
 
-  // Générer le slug à partir du nom
-  // ex: "Salon Fatima" → "salon-fatima"
   const slug = donnees.nom
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '') // supprimer les accents
-    .replace(/[^a-z0-9]+/g, '-') // remplacer les caractères spéciaux par -
-    .replace(/^-|-$/g, ''); // supprimer les - en début/fin
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
 
-  // Vérifier que le slug est unique — si pas, ajouter un suffixe
   const slugFinal = await genererSlugUnique(slug);
 
-  // Créer le prestataire dans Supabase
   const prestataire = await creerPrestataire({
     telephone: from,
     nom: donnees.nom,
     slug: slugFinal,
     plan: 'starter',
     statut_abonnement: 'actif',
+    essai_gratuit: true,
+    ambassadeur: false,
     date_expiration: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
       .toISOString()
       .split('T')[0],
     horaires,
   });
 
-  // Créer les services dans Supabase
   const { default: supabase } = await import('./supabaseService.js');
 
   for (const service of donnees.services) {
@@ -324,29 +338,29 @@ async function finaliserOnboarding(from, session, horaires, messageHoraires) {
     });
   }
 
-  // Supprimer la session d'onboarding — elle n'est plus nécessaire
   await supprimerOnboardingSession(from);
 
-  // Générer le lien client unique
   const numeroRiserv =
-    process.env.TWILIO_NUMBER?.replace('+', '') || 'XXXXXXXXXX';
+    process.env.META_PHONE_ID ||
+    process.env.TWILIO_NUMBER?.replace('+', '') ||
+    'XXXXXXXXXX';
   const lienClient = `https://wa.me/${numeroRiserv}?text=${encodeURIComponent(donnees.nom)}`;
 
-  // Message de félicitations
   const listeServices = donnees.services
     .map(s => `• ${s.nom} — ${s.duree_minutes} min — Rs ${s.prix}`)
     .join('\n');
 
   await envoyerMessage(
     from,
-    `🎉 Félicitations ! Votre établissement est configuré sur Riserv.\n\n` +
-      `📋 Récapitulatif :\n` +
-      `Nom : ${donnees.nom}\n\n` +
-      `Services :\n${listeServices}\n\n` +
-      `Horaires : ${messageHoraires}\n\n` +
-      `🔗 Votre lien client à partager :\n${lienClient}\n\n` +
-      `Partagez ce lien sur vos réseaux sociaux, votre carte de visite et votre Google Maps.\n\n` +
-      `Pour gérer votre agenda, écrivez-moi directement ici. Tapez "aide" si vous avez besoin d'assistance.`
+    `🎉 Votre établissement est maintenant en ligne sur Riserv !\n\n` +
+      `Voici ce que j'ai enregistré :\n\n` +
+      `📍 ${donnees.nom}\n\n` +
+      `💈 Services :\n${listeServices}\n\n` +
+      `🕐 Horaires : ${messageHoraires}\n\n` +
+      `🔗 Votre lien de réservation :\n${lienClient}\n\n` +
+      `Partagez ce lien avec vos clients — sur vos réseaux, votre carte de visite, Google Maps.\n\n` +
+      `Votre premier mois est entièrement gratuit, sans engagement. Si vous n'êtes pas satisfait, vous ne payez rien.\n\n` +
+      `Pour gérer votre agenda ou modifier vos services, écrivez-moi directement ici à tout moment.`
   );
 }
 
@@ -363,7 +377,6 @@ async function genererSlugUnique(slug) {
 
   if (!data || data.length === 0) return slug;
 
-  // Si le slug existe déjà, ajouter un numéro
   const slugsExistants = data.map(p => p.slug);
   let compteur = 2;
   let slugCandidat = `${slug}-${compteur}`;
