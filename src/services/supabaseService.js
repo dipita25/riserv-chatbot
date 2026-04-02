@@ -622,8 +622,36 @@ export async function enregistrerSignalement(donnees) {
     .select()
     .single();
 
-  if (error) throw error;
-  return data;
+  if (!error) return data;
+
+  const messageErreur = (error.message || '').toLowerCase();
+  const contientColonneEmetteurIntrouvable =
+    messageErreur.includes('emetteur_telephone') &&
+    messageErreur.includes('schema cache');
+  const contientTelephoneNotNull =
+    messageErreur.includes('null value in column "telephone"') &&
+    messageErreur.includes('violates not-null constraint');
+
+  // Compatibilite schema: certains environnements ont "telephone",
+  // d autres "emetteur_telephone". On retente automatiquement.
+  if (contientColonneEmetteurIntrouvable || contientTelephoneNotNull) {
+    const donneesCompat = { ...donnees };
+
+    if (donneesCompat.emetteur_telephone && !donneesCompat.telephone) {
+      donneesCompat.telephone = donneesCompat.emetteur_telephone;
+    }
+
+    const { data: dataCompat, error: errorCompat } = await supabase
+      .from('signalements')
+      .insert(donneesCompat)
+      .select()
+      .single();
+
+    if (errorCompat) throw errorCompat;
+    return dataCompat;
+  }
+
+  throw error;
 }
 
 export async function getSignalements(statut) {
