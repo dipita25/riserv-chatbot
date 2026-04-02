@@ -10,7 +10,7 @@ Le système de rate limiting protège votre application contre l'épuisement de 
 
 | Rôle | Limite | Période | Alerte à |
 |------|--------|---------|----------|
-| **Clients** | 15 messages | Par heure | 5 restants |
+| **Clients** | 22 messages | Par heure | 5 restants |
 | **Onboarding** | 20 messages | Total session | 5 restants |
 | **Prestataire Starter** | 30 messages | Par heure | 5 restants |
 | **Prestataire Pro** | 100 messages | Par heure | 5 restants |
@@ -23,17 +23,17 @@ Le système de rate limiting protège votre application contre l'épuisement de 
 
 ### Progression normale
 
-1. **Messages 1-10** : Traitement normal
-2. **Messages 11-15** (client) : Alerte apparaît
+1. **Messages** jusqu’à la zone d’alerte : traitement normal
+2. **Dès qu’il reste ≤ 5 messages** (client, cette heure) : alerte
    ```
    ⚠️ Il vous reste 3 messages cette heure
    (Renouvellement dans 38 minutes)
    ```
-3. **Message 16** : Blocage temporaire
+3. **Au-delà de la limite** : blocage temporaire
    ```
    ⛔ Limite de messages atteinte
    
-   Vous avez envoyé 15 messages cette heure.
+   Vous avez envoyé 22 messages cette heure.
    Vous pourrez nous écrire à nouveau dans 42 minutes.
    ```
 

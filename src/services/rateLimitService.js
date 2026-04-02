@@ -9,7 +9,8 @@ import { calculerMinutesRestantes, formaterDuree } from '../utils/tokenEstimator
 // LIMITES PAR RÔLE ET PLAN
 // ================================
 const LIMITES_PAR_ROLE = {
-  client: 15,
+  /** Messages IA / heure pour un client en parcours réservation (échanges souvent longs) */
+  client: 22,
   onboarding: 20, // Total pour toute la session
   prestataire: {
     starter: 30,

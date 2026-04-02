@@ -13,6 +13,7 @@ import {
 } from './supabaseService.js';
 import { envoyerMessage } from './whatsappService.js';
 import { formaterDate } from '../utils/dateUtils.js';
+import { getDetailsPlan } from './upgradeHandler.js';
 
 // ================================
 // CRON 1 — RAPPELS J-1
@@ -436,6 +437,120 @@ export async function detecterClientsAbusifs() {
 }
 
 // ================================
+// Fenêtre Maurice : veille 18h00 → ce jour 06h00 (12 h)
+// ================================
+function getFenetreRapportVeilleMaurice() {
+  const tz = 'Indian/Mauritius';
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const y = parts.find(p => p.type === 'year').value;
+  const mo = parts.find(p => p.type === 'month').value;
+  const d = parts.find(p => p.type === 'day').value;
+  const end = new Date(`${y}-${mo}-${d}T06:00:00+04:00`);
+  const start = new Date(end.getTime() - 12 * 60 * 60 * 1000);
+  return { start, end };
+}
+
+function messageRapportStarterVeille(prestataire, nbClients, nbTentatives) {
+  const lang = prestataire.langue || 'fr';
+  const details = getDetailsPlan('pro');
+  const avantages = details.avantages.slice(0, 5).join('\n');
+
+  if (lang === 'en') {
+    return (
+      `📊 *Overnight report (6:00 PM yesterday → 6:00 AM today)*\n\n` +
+      `*${nbClients}* distinct client number(s) tried to book with *${prestataire.nom}* outside Starter hours (online booking until 6:00 PM).\n\n` +
+      `Total attempts: *${nbTentatives}*.\n\n` +
+      `To stop missing these leads and avoid frustrating evening shoppers, consider upgrading to *Pro* (24/7 bookings for clients).\n\n` +
+      `📦 *PRO plan* — Rs 1,490/month\n${avantages}\n\n` +
+      `Reply *YES* here to learn more, or ignore this message.`
+    );
+  }
+  if (lang === 'cr') {
+    return (
+      `📊 *Rapor (yer 18h → sa gramatin 6h)*\n\n` +
+      `*${nbClients}* nimero kliyan diferan finn esey rezerv kot *${prestataire.nom}* apre ler Starter (rezervasyon an ligne ziska 18h).\n\n` +
+      `Total tantativ : *${nbTentatives}*.\n\n` +
+      `Pou pa perdi sa bann demand la, ou kapav pase *Pro* (rezervasyon 24h/24 pou kliyan).\n\n` +
+      `📦 *Plan PRO* — Rs 1,490/mwa\n${avantages}\n\n` +
+      `Repond *WI* isi pou plis info, ou ignor sa mesaz la.`
+    );
+  }
+  return (
+    `📊 *Rapport (hier 18h00 → ce matin 6h00)*\n\n` +
+    `*${nbClients}* numéro(s) de client distinct(s) ont tenté de réserver chez *${prestataire.nom}* en dehors des heures couvertes par le plan Starter (réservations en ligne jusqu'à 18h00).\n\n` +
+    `Nombre total de tentatives : *${nbTentatives}*.\n\n` +
+    `Pour ne plus manquer ces demandes et éviter de frustrer des clients qui écrivent le soir, vous pouvez passer au *plan Pro* (réservations 24h/24 côté clients).\n\n` +
+    `📦 *Plan PRO* — Rs 1,490/mois\n${avantages}\n\n` +
+    `Répondez *OUI* ici pour en discuter, ou ignorez ce message.`
+  );
+}
+
+// ================================
+// CRON — RAPPORT STARTER : tentatives après 18h (un message/jour à 6h00)
+// ================================
+export async function envoyerRapportStarterBlocagesVeille() {
+  console.log(
+    `[CRON] Rapport Starter (blocages 18h) — démarrage ${new Date().toISOString()}`
+  );
+
+  try {
+    const { start, end } = getFenetreRapportVeilleMaurice();
+    const { default: supabase } = await import('./supabaseService.js');
+
+    const { data: lignes, error } = await supabase
+      .from('journal_tentatives_apres_18h')
+      .select('prestataire_id, client_telephone')
+      .gte('created_at', start.toISOString())
+      .lt('created_at', end.toISOString());
+
+    if (error) throw error;
+
+    if (!lignes?.length) {
+      console.log(`[CRON] Aucun événement dans la fenêtre ${start.toISOString()} – ${end.toISOString()}`);
+      return;
+    }
+
+    const parPrestataire = new Map();
+    for (const l of lignes) {
+      if (!parPrestataire.has(l.prestataire_id)) {
+        parPrestataire.set(l.prestataire_id, []);
+      }
+      parPrestataire.get(l.prestataire_id).push(l.client_telephone);
+    }
+
+    let envoyes = 0;
+    for (const [prestataireId, telephones] of parPrestataire) {
+      const nbTentatives = telephones.length;
+      const nbClients = new Set(telephones).size;
+
+      const { data: p, error: errP } = await supabase
+        .from('prestataires')
+        .select('id, nom, telephone, plan, langue, statut_abonnement')
+        .eq('id', prestataireId)
+        .single();
+
+      if (errP || !p?.telephone) continue;
+      if (p.plan !== 'starter' || p.statut_abonnement !== 'actif') continue;
+
+      await envoyerMessage(p.telephone, messageRapportStarterVeille(p, nbClients, nbTentatives));
+      envoyes++;
+    }
+
+    console.log(
+      `[CRON] Rapport Starter terminé — ${envoyes} prestataire(s) notifié(s), ${lignes.length} ligne(s) journal`
+    );
+  } catch (err) {
+    console.error(`[CRON] Erreur rapport Starter blocages :`, err.message);
+  }
+}
+
+// ================================
 // CRON 6 — NETTOYAGE TENTATIVES ANCIENNES
 // Tourne chaque semaine (dimanche à 3h00)
 // Nettoie les tentatives_inconnus de plus de 7 jours
@@ -459,6 +574,17 @@ export async function nettoyerTentativesAnciennes() {
     const nombreSupprime = data?.length || 0;
     console.log(`[CRON] ${nombreSupprime} tentative(s) ancienne(s) supprimée(s)`);
 
+    const il_y_a_45_jours = new Date();
+    il_y_a_45_jours.setDate(il_y_a_45_jours.getDate() - 45);
+    const { error: errJ } = await supabase
+      .from('journal_tentatives_apres_18h')
+      .delete()
+      .lt('created_at', il_y_a_45_jours.toISOString());
+    if (errJ) {
+      console.warn(`[CRON] Nettoyage journal 18h :`, errJ.message);
+    } else {
+      console.log(`[CRON] Journal blocages 18h : entrées > 45 jours supprimées`);
+    }
   } catch (err) {
     console.error(`[CRON] Erreur nettoyage tentatives :`, err.message);
   }

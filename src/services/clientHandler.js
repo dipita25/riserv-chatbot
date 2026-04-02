@@ -31,6 +31,109 @@ import {
 import { trackConsommationToken, getMessageQuotaRestant, SEUIL_ALERTE } from './rateLimitService.js';
 import { estimerTokens } from '../utils/tokenEstimator.js';
 
+const STOPWORDS_MATCH = new Set([
+  'the', 'and', 'for', 'you', 'are', 'not', 'but', 'with', 'from', 'this', 'that',
+  'avec', 'dans', 'chez', 'cette', 'comme', 'aussi', 'plus', 'tout', 'tous', 'toute', 'toutes',
+  'bien', 'voir', 'faire', 'leur', 'meme', 'memes', 'ceux', 'celle', 'celles',
+  'sont', 'est', 'etais', 'ete', 'sans', 'sous', 'donc', 'ainsi',
+  'une', 'des', 'les', 'aux', 'son', 'ses', 'mes', 'tes', 'nos', 'vos', 'mon', 'ton', 'ma', 'ta',
+  'et', 'je', 'tu', 'il', 'elle', 'on', 'ils', 'elles', 'nous', 'vous',
+  'que', 'qui', 'quoi', 'dont', 'par', 'sur', 'vers', 'chez', 'merci', 'svp', 'please',
+  'bonjour', 'salut', 'hello', 'coucou', 'hey', 'alo',
+  'pour', 'votre', 'notre', 'leurs', 'avez', 'avons', 'pouvez', 'peux', 'peut',
+  'veux', 'veut', 'vouloir', 'souhaite', 'souhaitez', 'cherche', 'cherches', 'cherchez',
+  'besoin', 'besoins', 'prendre', 'prend', 'donner', 'donnez', 'indiquer', 'preciser',
+  'jour', 'soir', 'matin', 'aujourdhui', 'demain', 'rendez', 'rdv',
+  'oui', 'non', 'ok', 'si', 'ici', 'lah', 'là',
+  'very', 'much', 'have', 'has', 'had', 'want', 'need', 'like',
+]);
+
+function normalizePourMatch(s) {
+  if (!s || typeof s !== 'string') return '';
+  return s
+    .toLowerCase()
+    .replace(/'/g, ' ')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function construireCorpusClient(body, contexte, opts = {}) {
+  const maxMessages = opts.maxMessages ?? 35;
+  const derniersAssistant = opts.derniersAssistant ?? 0;
+  const parts = [(body || '').trim()];
+  const hist = Array.isArray(contexte) ? contexte : [];
+
+  if (derniersAssistant > 0) {
+    const assistants = hist
+      .filter(m => m.role === 'assistant')
+      .slice(-derniersAssistant);
+    for (const m of assistants) {
+      if (typeof m.content === 'string') {
+        const t = m.content.trim();
+        if (t) parts.push(t);
+      }
+    }
+  }
+
+  for (const m of hist.slice(-maxMessages)) {
+    if (m.role === 'user' && typeof m.content === 'string') {
+      const t = m.content.trim();
+      if (t) parts.push(t);
+    }
+  }
+  const seen = new Set();
+  const dedup = [];
+  for (const p of parts) {
+    const k = p.slice(0, 200);
+    if (!seen.has(k)) {
+      seen.add(k);
+      dedup.push(p);
+    }
+  }
+  return dedup.join('\n');
+}
+
+function appendUserPuisAssistant(messages, body, texteAssistant) {
+  const out = Array.isArray(messages) ? [...messages] : [];
+  const last = out[out.length - 1];
+  if (!(last?.role === 'user' && last?.content === body)) {
+    out.push({ role: 'user', content: body });
+  }
+  out.push({ role: 'assistant', content: texteAssistant });
+  return out;
+}
+
+function tokensDepuisCorpusNormalise(corpusNorm) {
+  return corpusNorm
+    .split(/\s+/)
+    .map(t => t.trim())
+    .filter(t => t.length >= 2 && !STOPWORDS_MATCH.has(t));
+}
+
+function prestatairesMatchantServices(liste, corpusNorm, tokens) {
+  const tokensForts = tokens.filter(t => t.length >= 3);
+  return liste.filter(p => {
+    const servicesActifs = (p.services || []).filter(s => s.actif);
+    return servicesActifs.some(s => {
+      const serviceNom = normalizePourMatch(s.nom || '');
+      if (!serviceNom) return false;
+      if (corpusNorm.includes(serviceNom)) return true;
+      const motsService = serviceNom.split(/\s+/).filter(w => w.length >= 2);
+      if (motsService.some(m => m.length >= 3 && corpusNorm.includes(m))) return true;
+      return tokensForts.some(t => serviceNom.includes(t));
+    });
+  });
+}
+
+function intentionServiceProbable(_corpusNorm, tokens) {
+  if (tokens.some(t => t.length >= 4)) return true;
+  if (tokens.filter(t => t.length >= 3).length >= 2) return true;
+  return false;
+}
+
 // ================================
 // SYSTEM PROMPT CLIENT
 // ================================
@@ -118,10 +221,7 @@ export async function handleClient(from, body, numMedia, clientExistant, rateLim
 
     if (!prestataire) {
       console.log(`[CLIENT ${clientId}] ⚠️ Prestataire non trouvé`);
-      await envoyerMessage(
-        from,
-        `Bonjour ! Pour prendre rendez-vous, veuillez utiliser le lien fourni par votre prestataire.`
-      );
+      await gererPrestataireNonIdentifie(from, body, contexte, conversation, clientId);
       return;
     }
 
@@ -157,41 +257,6 @@ export async function handleClient(from, body, numMedia, clientExistant, rateLim
       return;
     }
     
-    console.log(`[CLIENT ${clientId}] ✅ Disponibilité horaire OK`);
-
-    // Détection de signalement
-    if (contexte.length > 0) {
-      console.log(`[CLIENT ${clientId}] Analyse signalement potentiel...`);
-      const analyse = await detecterSignalement(body, contexte);
-      if (analyse.est_signalement && analyse.certitude === 'haute') {
-        console.log(`[CLIENT ${clientId}] 🚨 Signalement détecté: ${analyse.type}`);
-        await handleSignalement(from, body, 'client', {
-          description: analyse.description_extraite || body,
-          type: analyse.type,
-        });
-        return;
-      }
-      console.log(`[CLIENT ${clientId}] Pas de signalement détecté`);
-    }
-
-    // Filtre hors-sujet
-    if (contexte.length > 0) {
-      console.log(`[CLIENT ${clientId}] Vérification pertinence message...`);
-      const pertinent = await estMessagePertinent(body);
-      if (!pertinent) {
-        console.log(`[CLIENT ${clientId}] ⚠️ Message hors-sujet détecté`);
-        const msgPrenom = contexte.find(
-          m => m.role === 'system' && m.content?.startsWith('PRENOM_AGENT:')
-        );
-        const prenomAgent = msgPrenom
-          ? msgPrenom.content.replace('PRENOM_AGENT:', '').trim()
-          : 'votre conseiller';
-        await envoyerMessage(
-          from,
-          getMessageHorsSujet(prenomAgent, prestataire.nom)
-        );
-        return;
-      }
     console.log(`[CLIENT ${clientId}] ✅ Disponibilité horaire OK`);
 
     // Détection de signalement
@@ -272,6 +337,105 @@ export async function handleClient(from, body, numMedia, clientExistant, rateLim
 }
 
 // ================================
+// GÉRER CAS PRESTATAIRE NON IDENTIFIÉ
+// ================================
+async function gererPrestataireNonIdentifie(from, body, contexte, conversation, clientId) {
+  const { default: supabase } = await import('./supabaseService.js');
+  const { data: prestataires } = await supabase
+    .from('prestataires')
+    .select('id, nom, slug, services(nom, actif)')
+    .eq('statut_abonnement', 'actif');
+
+  const liste = prestataires || [];
+  const corpus = construireCorpusClient(body, contexte);
+  const corpusNorm = normalizePourMatch(corpus);
+  const tokens = tokensDepuisCorpusNormalise(corpusNorm);
+  const candidats = prestatairesMatchantServices(liste, corpusNorm, tokens);
+
+  console.log(`[CLIENT ${clientId}] Recherche prestataires par service`, {
+    corpusPreview: corpus.slice(0, 120),
+    tokens: tokens.slice(0, 12),
+    nbCandidats: candidats.length,
+  });
+
+  if (candidats.length > 0) {
+    const top = candidats.slice(0, 5);
+    const suggestion = top
+      .map((p, i) => {
+        const services = (p.services || [])
+          .filter(s => s.actif)
+          .slice(0, 3)
+          .map(s => s.nom)
+          .join(', ');
+        return `${i + 1}. ${p.nom}${services ? ` (${services})` : ''}`;
+      })
+      .join('\n');
+
+    const messages = conversation?.messages || contexte || [];
+    const texteListe =
+      `Je peux vous aider 😊\n\n` +
+      `J'ai trouvé ces prestataires qui pourraient vous convenir :\n${suggestion}\n\n` +
+      `Répondez avec le nom du prestataire choisi pour continuer la réservation.`;
+    await sauvegarderConversation(
+      from,
+      'client',
+      null,
+      appendUserPuisAssistant(messages, body, texteListe)
+    );
+
+    await envoyerMessage(from, texteListe);
+    return;
+  }
+
+  const exemplesPrestataires = liste
+    .slice(0, 5)
+    .map(p => p.nom)
+    .join(', ');
+  const exemplesServices = [...new Set(
+    liste
+      .flatMap(p => p.services || [])
+      .filter(s => s.actif)
+      .map(s => s.nom)
+  )]
+    .slice(0, 6)
+    .join(', ');
+
+  const messagesBase = conversation?.messages || contexte || [];
+
+  if (intentionServiceProbable(corpusNorm, tokens)) {
+    console.log(`[CLIENT ${clientId}] Aucun prestataire ne correspond au besoin exprimé (historique inclus)`);
+    const texteAucun =
+      `Merci pour votre message.\n\n` +
+      `Pour l'instant, nous n'avons aucun prestataire partenaire inscrit qui propose clairement ce type de prestation dans notre base.\n\n` +
+      `Vous pouvez :\n` +
+      `• nous donner le nom exact d'un établissement partenaire, ou\n` +
+      `• préciser un autre type de service (ex. : ${exemplesServices || 'coiffure, massage, soin du visage'}).`;
+    await sauvegarderConversation(
+      from,
+      'client',
+      null,
+      appendUserPuisAssistant(messagesBase, body, texteAucun)
+    );
+    await envoyerMessage(from, texteAucun);
+    return;
+  }
+
+  const texteInvit =
+    `Je peux vous aider à trouver le bon prestataire 😊\n\n` +
+    `Donnez-moi soit :\n` +
+    `1) Le nom du prestataire (ex: ${exemplesPrestataires || 'Beauty Lounge'})\n` +
+    `ou\n` +
+    `2) Le type de service recherché (ex: ${exemplesServices || 'coiffure, massage, manucure'}).`;
+  await sauvegarderConversation(
+    from,
+    'client',
+    null,
+    appendUserPuisAssistant(messagesBase, body, texteInvit)
+  );
+  await envoyerMessage(from, texteInvit);
+}
+
+// ================================
 // DÉTERMINER LE PRESTATAIRE VISÉ
 // ================================
 async function determinerPrestataire(from, body, contexte, conversation, clientId) {
@@ -300,11 +464,18 @@ async function determinerPrestataire(from, body, contexte, conversation, clientI
     return null;
   }
 
-  const prestataireTrouve = prestataires.find(
-    p =>
-      body.toLowerCase().includes(p.nom.toLowerCase()) ||
-      body.toLowerCase().includes(p.slug.toLowerCase())
-  ) || null;
+  const corpus = construireCorpusClient(body, contexte, { derniersAssistant: 3 });
+  const cNorm = normalizePourMatch(corpus);
+
+  const prestataireTrouve = prestataires.find(p => {
+    const nom = normalizePourMatch(p.nom || '');
+    const slug = normalizePourMatch((p.slug || '').replace(/-/g, ' '));
+    if (!nom && !slug) return false;
+    return (
+      (nom && (cNorm.includes(nom) || corpus.toLowerCase().includes((p.nom || '').toLowerCase()))) ||
+      (slug && cNorm.includes(slug))
+    );
+  }) || null;
 
   if (prestataireTrouve) {
     console.log(`[CLIENT ${clientId}] ✅ Prestataire trouvé: ${prestataireTrouve.nom}`);

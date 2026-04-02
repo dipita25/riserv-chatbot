@@ -114,6 +114,36 @@ function getMessageHorsHoraire(langue) {
   }
 }
 
+/** Message au client : la limite 18h vient du plan Starter *du prestataire*, pas de Riserv en général */
+function getMessageHorsHoraireClientPlanStarter(prestataire) {
+  const nom = prestataire?.nom || 'ce prestataire';
+  const langue = prestataire?.langue || 'fr';
+
+  switch (langue) {
+    case 'en':
+      return (
+        `⏰ *${nom}* is on the *Starter* plan: online bookings through Riserv are only possible until **6:00 PM** (Mauritius time).\n\n` +
+        `This is a limit set by their subscription, not your phone or WhatsApp.\n\n` +
+        `✅ To book with *${nom}*, you can try again **tomorrow from 6:00 AM**.\n\n` +
+        `💡 Or search for another provider on Riserv whose plan allows evening bookings (Pro / Business).`
+      );
+    case 'cr':
+      return (
+        `⏰ *${nom}* ena plan *Starter* : rezervasyon an ligne lor Riserv ziska **18h00** sel (ler Maurice).\n\n` +
+        `Sa limit la vini depi zabonman zot, pa depi ou telefon.\n\n` +
+        `✅ Pou rezerv kot *${nom}*, ou kapav reessay **demin depi 6h00 gramatin**.\n\n` +
+        `💡 Oubyen rod en lot prestater ki kapav rezerv apre 18h (plan Pro / Business).`
+      );
+    default:
+      return (
+        `⏰ *${nom}* est sur l'abonnement *Starter* : les réservations en ligne via Riserv ne sont possibles que **jusqu'à 18h00** (heure Maurice).\n\n` +
+        `C'est une limite liée à l'abonnement de cet établissement, pas à votre téléphone.\n\n` +
+        `✅ Pour réserver chez *${nom}*, vous pourrez réessayer **demain dès 6h00**.\n\n` +
+        `💡 Vous pouvez aussi consulter un autre prestataire sur Riserv dont l'offre permet les réservations en soirée (plans Pro ou Business).`
+      );
+  }
+}
+
 function getMessageHorsHorairePrestataire(langue) {
   const supportEmail = process.env.SUPPORT_EMAIL || 'support@riserv.mu';
   
@@ -353,7 +383,7 @@ export function estServiceDisponible(prestataire) {
   if (heure >= 18) {
     return {
       disponible: false,
-      message: getMessageHorsHoraire(prestataire.langue),
+      message: getMessageHorsHoraireClientPlanStarter(prestataire),
     };
   }
 

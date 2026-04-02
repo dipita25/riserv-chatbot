@@ -16,7 +16,7 @@ const MAX_MESSAGES_UPGRADE = 7;
 // ================================
 // DÉTAILS DES PLANS
 // ================================
-function getDetailsPlan(plan) {
+export function getDetailsPlan(plan) {
   const details = {
     starter: {
       prix: 990,
@@ -370,7 +370,6 @@ async function gererMessageGeneral(body, historique, demande) {
 export async function notifierPrestataireClientBloque18h(prestataire, clientTelephone) {
   const { default: supabase } = await import('./supabaseService.js');
 
-  // Vérifier si on a déjà notifié récemment
   const { data: tentative } = await supabase
     .from('tentatives_client_apres_18h')
     .select('*')
@@ -379,43 +378,28 @@ export async function notifierPrestataireClientBloque18h(prestataire, clientTele
     .single();
 
   if (tentative) {
-    // Incrémenter le compteur
     await supabase
       .from('tentatives_client_apres_18h')
-      .update({ 
+      .update({
         nombre_tentatives: tentative.nombre_tentatives + 1,
-        derniere_tentative: new Date().toISOString()
+        derniere_tentative: new Date().toISOString(),
       })
       .eq('id', tentative.id);
-
-    // Ne notifier que si pas déjà notifié et 3+ tentatives
-    if (!tentative.notif_prestataire_envoyee && tentative.nombre_tentatives + 1 >= 3) {
-      await supabase
-        .from('tentatives_client_apres_18h')
-        .update({ notif_prestataire_envoyee: true })
-        .eq('id', tentative.id);
-
-      const details = getDetailsPlan('pro');
-      const avantagesTexte = details.avantages.join('\n');
-
-      await envoyerMessage(
-        prestataire.telephone,
-        `⚠️ *Opportunité manquée*\n\n` +
-          `Un client a tenté de réserver ${tentative.nombre_tentatives + 1} fois après 18h00, mais votre plan Starter ne permet pas les réservations tardives.\n\n` +
-          `💡 *Passez au plan PRO pour ne plus perdre de clients :*\n\n` +
-          `📦 *Plan PRO* - Rs 1,490/mois\n\n` +
-          `${avantagesTexte}\n\n` +
-          `💳 Intéressé ? Répondez "OUI" et je vous guide pour l'upgrade.`
-      );
-    }
   } else {
-    // Première tentative
-    await supabase
-      .from('tentatives_client_apres_18h')
-      .insert({
-        prestataire_id: prestataire.id,
-        client_telephone: clientTelephone,
-        nombre_tentatives: 1,
-      });
+    await supabase.from('tentatives_client_apres_18h').insert({
+      prestataire_id: prestataire.id,
+      client_telephone: clientTelephone,
+      nombre_tentatives: 1,
+    });
+  }
+
+  const { error: journalErr } = await supabase
+    .from('journal_tentatives_apres_18h')
+    .insert({
+      prestataire_id: prestataire.id,
+      client_telephone: clientTelephone,
+    });
+  if (journalErr) {
+    console.error('[BLOCAGE_18H] Insert journal:', journalErr.message);
   }
 }

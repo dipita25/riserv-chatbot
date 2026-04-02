@@ -2,6 +2,8 @@ import twilio from 'twilio';
 import crypto from 'crypto';
 
 const provider = process.env.WHATSAPP_PROVIDER || 'twilio';
+const isDev = process.env.NODE_ENV === 'development';
+const devRealSend = process.env.WHATSAPP_DEV_REAL_SEND === 'true';
 
 console.log(`[WHATSAPP] Provider configuré: ${provider}`);
 
@@ -70,14 +72,24 @@ async function envoyerViaGupshup(to, message) {
       }),
     });
 
-    const result = await response.json();
+    const raw = await response.text();
+    let result;
+    try {
+      result = raw ? JSON.parse(raw) : {};
+    } catch {
+      result = { raw };
+    }
     
     if (!response.ok || result.status !== 'submitted') {
       console.error(`[GUPSHUP ${msgId}] ❌ Erreur réponse API:`, {
         status: response.status,
         result,
       });
-      throw new Error(`Gupshup API error: ${result.message || response.statusText}`);
+      throw new Error(
+        `Gupshup API error: ${
+          result.message || result.raw || response.statusText || 'Réponse non JSON'
+        }`
+      );
     }
 
     console.log(`[GUPSHUP ${msgId}] ✅ Envoyé (MessageId: ${result.messageId})`);
@@ -154,6 +166,18 @@ export async function envoyerMessage(to, message) {
       messageLength: message.length,
       preview: message.substring(0, 50) + (message.length > 50 ? '...' : ''),
     });
+
+    if (isDev && !devRealSend) {
+      console.log(`[SEND ${sendId}] 🧪 MODE DEV (simulation) - Aucun envoi provider`, {
+        to,
+        message,
+      });
+      return {
+        status: 'simulated',
+        provider: 'console',
+        to,
+      };
+    }
 
     if (provider === 'gupshup') {
       await envoyerViaGupshup(to, message);

@@ -397,6 +397,13 @@ if (process.env.NODE_ENV === 'development') {
       await import('../services/cronJobs.js');
     await alerterExpirationImminente();
   });
+
+  routerExpress.post('/test/rapport-starter-veille', async (req, res) => {
+    res.json({ status: 'ok', message: 'Rapport Starter (blocages 18h) lancé' });
+    const { envoyerRapportStarterBlocagesVeille } =
+      await import('../services/cronJobs.js');
+    await envoyerRapportStarterBlocagesVeille();
+  });
 }
 
 export default routerExpress;

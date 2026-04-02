@@ -8,6 +8,7 @@ import {
   suspendreAbonnementsExpires,
   alerterExpirationImminente,
   envoyerRapportJournalier,
+  envoyerRapportStarterBlocagesVeille,
   detecterClientsAbusifs,
   nettoyerTentativesAnciennes,
   nettoyerRateLimits,
@@ -61,6 +62,15 @@ function demarrerCronJobs() {
     { timezone: 'Indian/Mauritius' }
   );
 
+  // Rapport Starter — tentatives clients après 18h (veille 18h → ce jour 6h), un seul message/prestataire
+  cron.schedule(
+    '0 6 * * *',
+    async () => {
+      await envoyerRapportStarterBlocagesVeille();
+    },
+    { timezone: 'Indian/Mauritius' }
+  );
+
   // Rapport journalier admin — chaque jour à 17h00
   cron.schedule(
     '0 17 * * *',
@@ -101,6 +111,7 @@ function demarrerCronJobs() {
   console.log('  - Rappels J-1      : chaque jour à 20h00 (Maurice)');
   console.log('  - Suspension       : chaque jour à minuit (Maurice)');
   console.log('  - Alertes exp.     : chaque jour à 09h00 (Maurice)');
+  console.log('  - Rapport Starter  : chaque jour à 06h00 (Maurice)');
   console.log('  - Rapport admin    : chaque jour à 17h00 (Maurice)');
   console.log('  - Détection abus   : 2x/jour à 10h et 20h (Maurice)');
   console.log('  - Nettoyage tokens : chaque dimanche à 3h00 (Maurice)');

@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import {
   getPrestataire,
   getClient,
+  getConversation,
   getOnboardingSession,
   getTentativesInconnu,
   incrementerTentativeInconnu,
@@ -19,6 +20,23 @@ import { verifierRateLimit, incrementerCompteur, getMessageQuotaDepasse } from '
 
 const LIMITE_TENTATIVES = 3;
 const DELAI_BLOCAGE_HEURES = 24;
+
+function fluxReservationClientSansFicheEngage(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const marqueurs = [
+    'prestataires qui pourraient vous convenir',
+    'nom du prestataire choisi',
+    'aucun prestataire partenaire inscrit',
+    'trouver le bon prestataire',
+    'type de service recherché',
+    'type de prestation dans notre base',
+  ];
+  return messages.some(m => {
+    if (m.role !== 'assistant' || typeof m.content !== 'string') return false;
+    const c = m.content.toLowerCase();
+    return marqueurs.some(s => c.includes(s));
+  });
+}
 
 export async function router(from, body, numMedia) {
   const routerId = crypto.randomBytes(6).toString('hex');
@@ -47,7 +65,13 @@ export async function router(from, body, numMedia) {
         body.toLowerCase().includes('suspendre') ||
         body.toLowerCase().includes('réactiver') ||
         body.toLowerCase().includes('ambassadeur') ||
-        body.toLowerCase().includes('débannir');
+        body.toLowerCase().includes('débannir') ||
+        body.toLowerCase().includes('plan ') ||
+        body.toLowerCase().includes('changer le plan') ||
+        body.toLowerCase().includes('quel plan') ||
+        body.toLowerCase().includes('fiche ') ||
+        body.toLowerCase().includes('détails ') ||
+        body.toLowerCase().includes('detail ');
 
       if (estCommandeAdmin) {
         console.log(`[ROUTER ${routerId}] → Commande admin détectée`);
@@ -204,6 +228,26 @@ export async function router(from, body, numMedia) {
       }
     }
 
+    const convSansCompte = await getConversation(from);
+    if (fluxReservationClientSansFicheEngage(convSansCompte?.messages)) {
+      console.log(
+        `[ROUTER ${routerId}] ↪️ Flux réservation client (sans fiche) déjà engagé — on évite une nouvelle détection d'intention`
+      );
+      await supprimerTentativeInconnu(from);
+      const rateLimitSuite = await verifierRateLimit(from, 'client', null);
+      if (!rateLimitSuite.autorise) {
+        console.log(`[ROUTER ${routerId}] ⛔ Rate limit client dépassé`);
+        await envoyerMessage(
+          from,
+          getMessageQuotaDepasse(rateLimitSuite, 'client', null, 'fr')
+        );
+        return;
+      }
+      await incrementerCompteur(from, 'client', null);
+      await handleClient(from, body, numMedia, null, rateLimitSuite);
+      return;
+    }
+
     // ÉTAPE 5 — Détection d'intention (coûte des tokens)
     console.log(`[ROUTER ${routerId}] Détection d'intention via IA...`);
     const intention = await detecterIntention(body);
@@ -219,7 +263,17 @@ export async function router(from, body, numMedia) {
     if (intention === 'CLIENT') {
       console.log(`[ROUTER ${routerId}] → Redirection vers client`);
       await supprimerTentativeInconnu(from);
-      await handleClient(from, body, numMedia, null);
+      const rateLimitClient = await verifierRateLimit(from, 'client', null);
+      if (!rateLimitClient.autorise) {
+        console.log(`[ROUTER ${routerId}] ⛔ Rate limit client dépassé`);
+        await envoyerMessage(
+          from,
+          getMessageQuotaDepasse(rateLimitClient, 'client', null, 'fr')
+        );
+        return;
+      }
+      await incrementerCompteur(from, 'client', null);
+      await handleClient(from, body, numMedia, null, rateLimitClient);
       return;
     }
 

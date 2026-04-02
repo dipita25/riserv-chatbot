@@ -49,6 +49,11 @@ GUPSHUP_WEBHOOK_TOKEN=le_token_genere_ci_dessus
 
 # IP Whitelisting (optionnel mais recommandé)
 GUPSHUP_ALLOWED_IPS=
+
+# Développement local:
+# false = simulation console (aucun envoi réel)
+# true  = envoi réel vers le provider configuré
+WHATSAPP_DEV_REAL_SEND=false
 ```
 
 ### 5. Configurer le Webhook dans Gupshup
@@ -98,6 +103,35 @@ GUPSHUP_ALLOWED_IPS=1.2.3.4,5.6.7.8,10.20.30.40
 ```
 
 ### 7. Tester la Configuration
+
+#### Test local rapide via Postman (simulate)
+
+Endpoint:
+
+`POST http://localhost:3000/simulate`
+
+Headers:
+
+- `Content-Type: application/json`
+
+Body (raw JSON):
+
+```json
+{
+  "from": "+23057000003",
+  "body": "Bonjour, je cherche un massage"
+}
+```
+
+Comportement attendu en dev:
+
+- Si `WHATSAPP_DEV_REAL_SEND=false` : réponse affichée en console, sans envoi réel WhatsApp
+- Si `WHATSAPP_DEV_REAL_SEND=true` : envoi réel via provider (`WHATSAPP_PROVIDER`)
+
+Important:
+
+- En mode `simulate`, les contrôles de provenance/signature webhook ne sont pas appliqués (c'est volontaire pour les tests locaux).
+- Les contrôles de sécurité s'appliquent sur `POST /webhook`.
 
 #### Test 1 : Vérifier la sécurité
 
