@@ -241,8 +241,9 @@ export async function estMessagePertinent(message) {
     
     const reponse = await appellerIA(
       `Tu analyses des messages WhatsApp pour un service de réservation de rendez-vous.
-Un message est PERTINENT s'il concerne : prendre rendez-vous, annuler, choisir un service ou créneau, confirmer, les horaires, les services disponibles, la gestion d'agenda, un problème technique avec la plateforme, ou une réclamation.
-Un message est HORS_SUJET s'il n'a aucun rapport avec ces sujets.
+Un message est PERTINENT s'il concerne : prendre rendez-vous, annuler, choisir un service ou créneau, confirmer, les horaires, les services disponibles, changer de prestataire ou d'établissement, demander quoi faire ensuite ou de l'aide pendant une réservation, la gestion d'agenda, un problème avec la réservation, ou une réclamation.
+Les phrases courtes de relance ("je fais quoi alors ?", "et maintenant ?", "comment faire ?") pendant un échange de réservation sont PERTINENTES.
+Un message est HORS_SUJET seulement s'il n'a vraiment aucun rapport avec une réservation ou l'usage du service (ex. météo, politique, sujet totalement sans lien).
 Réponds UNIQUEMENT par : PERTINENT ou HORS_SUJET`,
       [{ role: 'user', content: message }],
       10
@@ -259,6 +260,19 @@ Réponds UNIQUEMENT par : PERTINENT ou HORS_SUJET`,
   }
 }
 
+function formaterContextePourSignalement(contexte) {
+  if (!Array.isArray(contexte) || contexte.length === 0) return '';
+  const recent = contexte.slice(-8);
+  const lignes = recent
+    .filter(m => m && typeof m.content === 'string' && m.role !== 'system')
+    .map(m => {
+      const role = m.role === 'assistant' ? 'Assistant' : 'Utilisateur';
+      return `${role}: ${m.content.slice(0, 500)}`;
+    });
+  if (lignes.length === 0) return '';
+  return `\n\nContexte récent :\n${lignes.join('\n')}`;
+}
+
 // ================================
 // DÉTECTION DE SIGNALEMENT
 // ================================
@@ -267,7 +281,8 @@ export async function detecterSignalement(message, contexte) {
   
   try {
     console.log(`[IA-SIGNALEMENT ${signalId}] Analyse signalement: "${message.substring(0, 50)}..."`);
-    
+    const contenuUtilisateur = `${message}${formaterContextePourSignalement(contexte)}`;
+
     const reponse = await appellerIA(
       `Tu analyses un message WhatsApp pour détecter si l'utilisateur signale un problème technique ou une réclamation concernant la plateforme Riserv.
 
@@ -279,8 +294,9 @@ Réponds UNIQUEMENT en JSON :
   "description_extraite": "description brève du problème si détectée, sinon null"
 }
 
-Exemples de signalements : "ça ne marche pas", "j'ai un problème", "mon RDV n'apparaît pas", "le bot ne répond plus", "j'ai payé mais mon compte n'est pas activé".`,
-      [{ role: 'user', content: message }],
+Exemples de signalements : "ça ne marche pas", "j'ai un problème", "mon RDV n'apparaît pas", "le bot ne répond plus", "j'ai payé mais mon compte n'est pas activé".
+Un message court comme "toujours pas" ou "idem" peut être un signalement si le contexte montre déjà un souci.`,
+      [{ role: 'user', content: contenuUtilisateur }],
       200
     );
 

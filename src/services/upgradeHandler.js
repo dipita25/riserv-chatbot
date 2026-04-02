@@ -6,10 +6,12 @@ import {
   supprimerDemandeUpgrade,
   getConversationUpgrade,
   ajouterMessageUpgrade,
+  getConversation,
 } from './supabaseService.js';
 import { envoyerMessage } from './whatsappService.js';
 import { appellerIADirect } from './claudeService.js';
 import { formaterDate } from '../utils/dateUtils.js';
+import { traiterSignalementPrioritaire } from './signalementUtils.js';
 
 const MAX_MESSAGES_UPGRADE = 7;
 
@@ -60,6 +62,12 @@ export function getDetailsPlan(plan) {
 // ================================
 export async function handleUpgrade(from, body, numMedia, prestataire) {
   console.log(`[UPGRADE] Traitement demande pour ${prestataire.nom}`);
+
+  const conversation = await getConversation(from);
+  const contexteUpgrade = conversation?.messages || [];
+  if (await traiterSignalementPrioritaire(from, body, contexteUpgrade, 'prestataire')) {
+    return;
+  }
 
   // Vérifier s'il y a une demande en cours
   let demande = await getDemandeUpgradeEnCours(prestataire.id);

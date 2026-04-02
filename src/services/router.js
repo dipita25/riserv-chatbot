@@ -7,9 +7,15 @@ import {
   getTentativesInconnu,
   incrementerTentativeInconnu,
   supprimerTentativeInconnu,
+  supprimerOnboardingSession,
+  supprimerConversation,
   getDemandeUpgradeEnCours,
 } from './supabaseService.js';
 import { detecterIntention } from './claudeService.js';
+import {
+  detecterBasculeVersOnboardingPrestataire,
+  detecterBasculeVersReservationClient,
+} from './intentionBascule.js';
 import { envoyerMessage } from './whatsappService.js';
 import { handleOnboarding } from './onboardingHandler.js';
 import { handleClient } from './clientHandler.js';
@@ -167,7 +173,28 @@ export async function router(from, body, numMedia) {
       console.log(`[ROUTER ${routerId}] ✅ Identifié: ONBOARDING`, {
         etape: onboardingSession.etape_courante,
       });
-      
+
+      if (await detecterBasculeVersReservationClient(body)) {
+        console.log(
+          `[ROUTER ${routerId}] ↪️ Bascule onboarding → réservation client (intention explicite)`
+        );
+        await supprimerOnboardingSession(from);
+        await supprimerConversation(from).catch(() => {});
+        const rateLimitClient = await verifierRateLimit(from, 'client', null);
+        if (!rateLimitClient.autorise) {
+          console.log(`[ROUTER ${routerId}] ⛔ Rate limit client dépassé`);
+          await envoyerMessage(
+            from,
+            getMessageQuotaDepasse(rateLimitClient, 'client', null, 'fr')
+          );
+          return;
+        }
+        await incrementerCompteur(from, 'client', null);
+        const clientPourFlux = await getClient(from);
+        await handleClient(from, body, numMedia, clientPourFlux, rateLimitClient);
+        return;
+      }
+
       // Vérifier rate limit onboarding
       const rateLimit = await verifierRateLimit(from, 'onboarding', null);
       if (!rateLimit.autorise) {
@@ -190,7 +217,27 @@ export async function router(from, body, numMedia) {
         langue: client.langue,
         banni: client.banni,
       });
-      
+
+      if (await detecterBasculeVersOnboardingPrestataire(body)) {
+        console.log(
+          `[ROUTER ${routerId}] ↪️ Bascule client connu → onboarding prestataire (intention explicite)`
+        );
+        await supprimerConversation(from).catch(() => {});
+        await supprimerOnboardingSession(from).catch(() => {});
+        const rateLimitOnboarding = await verifierRateLimit(from, 'onboarding', null);
+        if (!rateLimitOnboarding.autorise) {
+          console.log(`[ROUTER ${routerId}] ⛔ Rate limit onboarding dépassé`);
+          await envoyerMessage(
+            from,
+            getMessageQuotaDepasse(rateLimitOnboarding, 'onboarding', null, client.langue || 'fr')
+          );
+          return;
+        }
+        await incrementerCompteur(from, 'onboarding', null);
+        await handleOnboarding(from, body, null, rateLimitOnboarding);
+        return;
+      }
+
       // Vérifier rate limit client
       const rateLimit = await verifierRateLimit(from, 'client', null);
       if (!rateLimit.autorise) {
@@ -226,6 +273,26 @@ export async function router(from, body, numMedia) {
         console.log(`[ROUTER ${routerId}] Délai écoulé, suppression du blocage`);
         await supprimerTentativeInconnu(from);
       }
+    }
+
+    if (await detecterBasculeVersOnboardingPrestataire(body)) {
+      console.log(
+        `[ROUTER ${routerId}] ↪️ Bascule vers onboarding prestataire (y compris depuis flux réservation sans fiche)`
+      );
+      await supprimerTentativeInconnu(from);
+      await supprimerConversation(from).catch(() => {});
+      const rateLimitOnboarding = await verifierRateLimit(from, 'onboarding', null);
+      if (!rateLimitOnboarding.autorise) {
+        console.log(`[ROUTER ${routerId}] ⛔ Rate limit onboarding dépassé`);
+        await envoyerMessage(
+          from,
+          getMessageQuotaDepasse(rateLimitOnboarding, 'onboarding', null, 'fr')
+        );
+        return;
+      }
+      await incrementerCompteur(from, 'onboarding', null);
+      await handleOnboarding(from, body, null, rateLimitOnboarding);
+      return;
     }
 
     const convSansCompte = await getConversation(from);

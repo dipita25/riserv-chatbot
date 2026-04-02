@@ -294,6 +294,26 @@ export async function sauvegarderConversation(
   }
 }
 
+/** Efface le prestataire lié (ex. le client veut réserver chez quelqu'un d'autre) */
+export async function reinitialiserPrestataireConversation(telephone) {
+  const { error } = await supabase
+    .from('conversations')
+    .update({ prestataire_id: null })
+    .eq('telephone', telephone);
+
+  if (error) throw error;
+}
+
+/** Supprime la conversation (ex. bascule onboarding ↔ réservation) */
+export async function supprimerConversation(telephone) {
+  const { error } = await supabase
+    .from('conversations')
+    .delete()
+    .eq('telephone', telephone);
+
+  if (error) throw error;
+}
+
 // ================================
 // SERVICES
 // ================================

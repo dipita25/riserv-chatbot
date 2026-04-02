@@ -17,6 +17,7 @@ import {
   supprimerService,
   getReservationsFuturesService,
   mettreAJourPrestataire,
+  getConversation,
 } from './supabaseService.js';
 import { envoyerMessage } from './whatsappService.js';
 import { envoyerMessageClaude } from './claudeService.js';
@@ -24,6 +25,7 @@ import { formaterDate, getJourSemaine } from '../utils/dateUtils.js';
 import { verifierAcces } from '../middlewares/verifierAcces.js';
 import { trackConsommationToken, getMessageQuotaRestant, SEUIL_ALERTE } from './rateLimitService.js';
 import { estimerTokens } from '../utils/tokenEstimator.js';
+import { traiterSignalementPrioritaire } from './signalementUtils.js';
 
 // ================================
 // SYSTEM PROMPT PRESTATAIRE
@@ -81,6 +83,12 @@ export async function handlePrestataire(from, body, numMedia, prestataire, rateL
   console.log(`[PRESTATAIRE ${handlerId}] Rate limit restant: ${rateLimit?.restant || 'N/A'}`);
 
   try {
+    const conversation = await getConversation(from);
+    const contextePrestataire = conversation?.messages || [];
+    if (await traiterSignalementPrioritaire(from, body, contextePrestataire, 'prestataire')) {
+      return;
+    }
+
     // Bypass pour l'admin — accès total sans restriction
     const adminPhone = process.env.ADMIN_PHONE;
     const estAdmin = adminPhone && from === adminPhone;

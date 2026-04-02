@@ -4,11 +4,13 @@ import {
   mettreAJourOnboardingSession,
   supprimerOnboardingSession,
   creerPrestataire,
+  getConversation,
 } from './supabaseService.js';
 import { envoyerMessage } from './whatsappService.js';
 import { envoyerMessageClaude } from './claudeService.js';
 import { trackConsommationToken, getMessageQuotaRestant, SEUIL_ALERTE } from './rateLimitService.js';
 import { estimerTokens } from '../utils/tokenEstimator.js';
+import { traiterSignalementPrioritaire } from './signalementUtils.js';
 
 // ================================
 // SYSTEM PROMPT ONBOARDING
@@ -35,6 +37,12 @@ RÈGLES IMPORTANTES :
 // POINT D'ENTRÉE PRINCIPAL
 // ================================
 export async function handleOnboarding(from, body, sessionExistante, rateLimit) {
+  const conversation = await getConversation(from);
+  const contexteOnboarding = conversation?.messages || [];
+  if (await traiterSignalementPrioritaire(from, body, contexteOnboarding, 'onboarding')) {
+    return;
+  }
+
   if (!sessionExistante) {
     await demarrerOnboarding(from);
     return;

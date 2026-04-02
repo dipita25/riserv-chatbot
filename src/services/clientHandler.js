@@ -13,15 +13,12 @@ import {
   getConversation,
   getAnnulationsRecentesClient,
   bannirClient,
+  reinitialiserPrestataireConversation,
 } from './supabaseService.js';
 import { envoyerMessage } from './whatsappService.js';
-import {
-  envoyerMessageClaude,
-  estMessagePertinent,
-  detecterSignalement,
-} from './claudeService.js';
+import { envoyerMessageClaude, estMessagePertinent } from './claudeService.js';
 import { estServiceDisponible } from '../middlewares/verifierAcces.js';
-import { handleSignalement } from './signalementHandler.js';
+import { traiterSignalementPrioritaire } from './signalementUtils.js';
 import { notifierPrestataireClientBloque18h } from './upgradeHandler.js';
 import {
   getProchainsJoursOuvres,
@@ -134,6 +131,160 @@ function intentionServiceProbable(_corpusNorm, tokens) {
   return false;
 }
 
+/** Inviter des pros à s'inscrire — bloc réutilisable */
+const SUGGESTION_INVITER_PRESTATAIRE_RISERV =
+  `Connaissez-vous un prestataire ou une entreprise qui pourrait vous convenir ? ` +
+  `Si oui, vous pouvez leur suggérer de rejoindre Riserv sur WhatsApp (inscription simple et gratuite) : ` +
+  `ainsi, vous pourrez réserver plus facilement les prochaines fois.`;
+
+const MOTS_TYPE_SERVICE = new Set([
+  'coiffure',
+  'coiffeur',
+  'coiffeuse',
+  'coupe',
+  'barbe',
+  'rasage',
+  'coloration',
+  'brushing',
+  'massage',
+  'manucure',
+  'pedicure',
+  'ongles',
+  'ongle',
+  'nails',
+  'vernis',
+  'soin',
+  'soins',
+  'facial',
+  'epilation',
+  'wax',
+  'lissage',
+  'extensions',
+  'maquillage',
+  'tatouage',
+  'physio',
+  'osteo',
+  'dentiste',
+  'veterinaire',
+  'yoga',
+  'pilates',
+  'fitness',
+  'haircut',
+  'hair',
+  'beard',
+  'waxing',
+  'spa',
+]);
+
+function estRechercheParTypeDeService(corpusNorm, tokens) {
+  for (const t of tokens) {
+    if (t.length >= 3 && MOTS_TYPE_SERVICE.has(t)) return true;
+  }
+  const fragments = [
+    'coiffure',
+    'massage',
+    'manucure',
+    'coupe',
+    'barbe',
+    'soin',
+    'epilation',
+    'pedicure',
+    'coloration',
+    'rasage',
+  ];
+  return fragments.some(f => corpusNorm.includes(f));
+}
+
+function messageAssistantDemandaitNomOuListePrestataire(contexte) {
+  const assistants = (Array.isArray(contexte) ? contexte : [])
+    .filter(m => m.role === 'assistant')
+    .slice(-5);
+  const marqueurs = [
+    'nom du prestataire choisi',
+    'répondez avec le nom',
+    'nom du prestataire',
+    'prestataires qui pourraient vous convenir',
+    "j'ai trouvé ces prestataires",
+    'trouver le bon prestataire',
+    'type de service recherché',
+  ];
+  for (let i = assistants.length - 1; i >= 0; i--) {
+    const c = (assistants[i].content || '').toLowerCase();
+    if (marqueurs.some(x => c.includes(x))) return true;
+  }
+  return false;
+}
+
+function estRechercheParNomEtablissement(body) {
+  const b = (body || '').toLowerCase();
+  return (
+    /\b(salon|institut|spa|clinique|cabinet|studio|centre|beauty|lounge|barbershop|onglerie|barbier)\b/.test(
+      b
+    ) ||
+    /\b(l'|la |le )?(établissement|entreprise|boutique)\b/.test(b) ||
+    /\bchez\s+[a-zàâäéèêëïîôùûç]/i.test(b)
+  );
+}
+
+function estProbableNomOuEtablissementSansTypeService(tokens, corpusNorm) {
+  if (tokens.length < 2 || tokens.length > 6) return false;
+  if (estRechercheParTypeDeService(corpusNorm, tokens)) return false;
+  return tokens.every(t => t.length >= 3);
+}
+
+/**
+ * Aucun prestataire en base ne correspond : distinguer recherche par type de prestation
+ * vs recherche par nom d'établissement / réponse à « donnez le nom ».
+ */
+function casRechercheSansPrestataire(body, contexte, corpusNorm, tokens) {
+  const typeService = estRechercheParTypeDeService(corpusNorm, tokens);
+  const nomEtab = estRechercheParNomEtablissement(body);
+  const suiteListe = messageAssistantDemandaitNomOuListePrestataire(contexte);
+  const probableNom = estProbableNomOuEtablissementSansTypeService(tokens, corpusNorm);
+
+  if ((nomEtab || suiteListe || probableNom) && !typeService) {
+    return 'etablissement_introuvable';
+  }
+  if (intentionServiceProbable(corpusNorm, tokens)) {
+    return 'service_sans_partenaire';
+  }
+  return 'invitation_generique';
+}
+
+/** Le client veut quitter le prestataire courant et en choisir un autre */
+function veutChangerDePrestataire(body) {
+  const b = (body || '').toLowerCase();
+  return (
+    /\bautre prestataire\b/.test(b) ||
+    /\bun autre prestataire\b/.test(b) ||
+    /\b(prene|prendre|cherche|veux|souhaite).{0,40}(rdv|rendez-vous).{0,30}(autre|ailleurs)\b/.test(
+      b
+    ) ||
+    /\bchanger de (prestataire|salon|coiffeur|établissement)\b/.test(b) ||
+    /\bpas chez (lui|elle|eux)\b/.test(b) ||
+    /\b(pas le bon|ce n'est pas le bon) (salon|prestataire)\b/.test(b) ||
+    /\b(réserver|rdv|rendez-vous)\s+(ailleurs|autre part|chez un autre)\b/.test(b) ||
+    /\bprendre\s+rendez[- ]?vous\s+avec\s+un\s+autre\b/.test(b)
+  );
+}
+
+/** Relance / clarification dans un flux réservation (ne doit pas être classé hors-sujet) */
+function estRelanceOuClarificationReservation(body) {
+  const b = (body || '').toLowerCase().trim();
+  if (b.length > 100) return false;
+  return (
+    /\b(je fais quoi|qu'est-?ce que je fais|comment je (fais|dois)|comment faire|et maintenant|je comprends pas|je ne comprends pas|pourquoi ça|ça marche pas|ça ne marche pas)\b/.test(
+      b
+    ) ||
+    /^(alors|donc)\s*\?*\s*$/i.test(b) ||
+    (b.length < 55 && /\b(alors|donc)\b/.test(b) && /\?/.test(b))
+  );
+}
+
+function doitIgnorerFiltrePertinence(body) {
+  return veutChangerDePrestataire(body) || estRelanceOuClarificationReservation(body);
+}
+
 // ================================
 // SYSTEM PROMPT CLIENT
 // ================================
@@ -185,7 +336,30 @@ export async function handleClient(from, body, numMedia, clientExistant, rateLim
   console.log(`[CLIENT ${clientId}] Rate limit restant: ${rateLimit?.restant || 'N/A'}`);
 
   try {
-    // Vérification bannissement client
+    if (body.trim().toUpperCase() === 'ANNULER') {
+      console.log(`[CLIENT ${clientId}] → Mot-clé ANNULER détecté`);
+      await traiterAnnulationClient(from, clientExistant, clientId);
+      return;
+    }
+
+    console.log(`[CLIENT ${clientId}] Chargement conversation...`);
+    let conversation = await getConversation(from);
+    let contexte = conversation?.messages || [];
+    console.log(`[CLIENT ${clientId}] Historique: ${contexte.length} messages`);
+
+    const veutAutrePrestataire = veutChangerDePrestataire(body);
+    if (veutAutrePrestataire && conversation?.prestataire_id) {
+      console.log(`[CLIENT ${clientId}] ↪️ Changement de prestataire demandé — réinitialisation du lien conversation`);
+      await reinitialiserPrestataireConversation(from);
+      conversation = await getConversation(from);
+      contexte = conversation?.messages || [];
+    }
+
+    if (await traiterSignalementPrioritaire(from, body, contexte, 'client')) {
+      return;
+    }
+
+    // Vérification bannissement client (après signalement : le client peut toujours signaler un problème)
     if (clientExistant?.banni) {
       console.log(`[CLIENT ${clientId}] ⛔ Client banni détecté`);
       const supportEmail = process.env.SUPPORT_EMAIL || 'support@riserv.mu';
@@ -199,24 +373,14 @@ export async function handleClient(from, body, numMedia, clientExistant, rateLim
       return;
     }
 
-    if (body.trim().toUpperCase() === 'ANNULER') {
-      console.log(`[CLIENT ${clientId}] → Mot-clé ANNULER détecté`);
-      await traiterAnnulationClient(from, clientExistant, clientId);
-      return;
-    }
-
-    console.log(`[CLIENT ${clientId}] Chargement conversation...`);
-    const conversation = await getConversation(from);
-    const contexte = conversation?.messages || [];
-    console.log(`[CLIENT ${clientId}] Historique: ${contexte.length} messages`);
-
     console.log(`[CLIENT ${clientId}] Détermination prestataire...`);
     const prestataire = await determinerPrestataire(
       from,
       body,
       contexte,
       conversation,
-      clientId
+      clientId,
+      { ignorerAssistantPourMatchPrestataire: veutAutrePrestataire }
     );
 
     if (!prestataire) {
@@ -259,25 +423,17 @@ export async function handleClient(from, body, numMedia, clientExistant, rateLim
     
     console.log(`[CLIENT ${clientId}] ✅ Disponibilité horaire OK`);
 
-    // Détection de signalement
+    // Filtre hors-sujet (pas sur les relances / « autre prestataire » — risque de faux hors-sujet)
     if (contexte.length > 0) {
-      console.log(`[CLIENT ${clientId}] Analyse signalement potentiel...`);
-      const analyse = await detecterSignalement(body, contexte);
-      if (analyse.est_signalement && analyse.certitude === 'haute') {
-        console.log(`[CLIENT ${clientId}] 🚨 Signalement détecté: ${analyse.type}`);
-        await handleSignalement(from, body, 'client', {
-          description: analyse.description_extraite || body,
-          type: analyse.type,
-        });
-        return;
+      let pertinent = true;
+      if (!doitIgnorerFiltrePertinence(body)) {
+        console.log(`[CLIENT ${clientId}] Vérification pertinence message...`);
+        pertinent = await estMessagePertinent(body);
+      } else {
+        console.log(
+          `[CLIENT ${clientId}] Filtre pertinence ignoré (clarification réservation ou changement de prestataire)`
+        );
       }
-      console.log(`[CLIENT ${clientId}] Pas de signalement détecté`);
-    }
-
-    // Filtre hors-sujet
-    if (contexte.length > 0) {
-      console.log(`[CLIENT ${clientId}] Vérification pertinence message...`);
-      const pertinent = await estMessagePertinent(body);
       if (!pertinent) {
         console.log(`[CLIENT ${clientId}] ⚠️ Message hors-sujet détecté`);
         const msgPrenom = contexte.find(
@@ -402,13 +558,16 @@ async function gererPrestataireNonIdentifie(from, body, contexte, conversation, 
 
   const messagesBase = conversation?.messages || contexte || [];
 
-  if (intentionServiceProbable(corpusNorm, tokens)) {
-    console.log(`[CLIENT ${clientId}] Aucun prestataire ne correspond au besoin exprimé (historique inclus)`);
+  const cas = casRechercheSansPrestataire(body, contexte, corpusNorm, tokens);
+
+  if (cas === 'service_sans_partenaire') {
+    console.log(`[CLIENT ${clientId}] Aucun prestataire ne correspond au type de prestation (historique inclus)`);
     const texteAucun =
       `Merci pour votre message.\n\n` +
       `Pour l'instant, nous n'avons aucun prestataire partenaire inscrit qui propose clairement ce type de prestation dans notre base.\n\n` +
-      `Vous pouvez :\n` +
-      `• nous donner le nom exact d'un établissement partenaire, ou\n` +
+      `${SUGGESTION_INVITER_PRESTATAIRE_RISERV}\n\n` +
+      `Vous pouvez aussi :\n` +
+      `• nous donner le nom exact d'un établissement déjà partenaire, ou\n` +
       `• préciser un autre type de service (ex. : ${exemplesServices || 'coiffure, massage, soin du visage'}).`;
     await sauvegarderConversation(
       from,
@@ -420,12 +579,29 @@ async function gererPrestataireNonIdentifie(from, body, contexte, conversation, 
     return;
   }
 
+  if (cas === 'etablissement_introuvable') {
+    console.log(`[CLIENT ${clientId}] Recherche par nom d'établissement sans correspondance en base`);
+    const texteNom =
+      `Nous ne trouvons pas cet établissement ou ce prestataire dans notre réseau pour l'instant.\n\n` +
+      `${SUGGESTION_INVITER_PRESTATAIRE_RISERV}\n\n` +
+      `Vous pouvez réessayer avec le nom exact tel qu'affiché, ou indiquer le type de service recherché (ex. : ${exemplesServices || 'coiffure, massage, manucure'}).`;
+    await sauvegarderConversation(
+      from,
+      'client',
+      null,
+      appendUserPuisAssistant(messagesBase, body, texteNom)
+    );
+    await envoyerMessage(from, texteNom);
+    return;
+  }
+
   const texteInvit =
     `Je peux vous aider à trouver le bon prestataire 😊\n\n` +
     `Donnez-moi soit :\n` +
     `1) Le nom du prestataire (ex: ${exemplesPrestataires || 'Beauty Lounge'})\n` +
     `ou\n` +
-    `2) Le type de service recherché (ex: ${exemplesServices || 'coiffure, massage, manucure'}).`;
+    `2) Le type de service recherché (ex: ${exemplesServices || 'coiffure, massage, manucure'}).\n\n` +
+    `💡 Si vous connaissez un professionnel qui n'est pas encore sur Riserv, vous pouvez lui suggérer de s'inscrire sur ce numéro — cela simplifiera vos prochaines réservations.`;
   await sauvegarderConversation(
     from,
     'client',
@@ -438,7 +614,16 @@ async function gererPrestataireNonIdentifie(from, body, contexte, conversation, 
 // ================================
 // DÉTERMINER LE PRESTATAIRE VISÉ
 // ================================
-async function determinerPrestataire(from, body, contexte, conversation, clientId) {
+async function determinerPrestataire(
+  from,
+  body,
+  contexte,
+  conversation,
+  clientId,
+  options = {}
+) {
+  const { ignorerAssistantPourMatchPrestataire = false } = options;
+
   console.log(`[CLIENT ${clientId}] Détermination prestataire...`);
   
   if (conversation?.prestataire_id) {
@@ -464,7 +649,9 @@ async function determinerPrestataire(from, body, contexte, conversation, clientI
     return null;
   }
 
-  const corpus = construireCorpusClient(body, contexte, { derniersAssistant: 3 });
+  const corpus = construireCorpusClient(body, contexte, {
+    derniersAssistant: ignorerAssistantPourMatchPrestataire ? 0 : 3,
+  });
   const cNorm = normalizePourMatch(corpus);
 
   const prestataireTrouve = prestataires.find(p => {
